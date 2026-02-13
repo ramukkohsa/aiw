@@ -1,0 +1,133 @@
+# Unified AI Workspace Configuration
+# Edit this file to add tools, projects, or change paths.
+
+[workspace]
+name = "ashok-palle-devops"
+root = "/mnt/c/Users/ashok.palle/.ai-workspace"
+wsl_root = "/home/ashokpalle/.ai-workspace"
+
+[defaults]
+editor = "code"      # $EDITOR override for brief/stuck commands
+default_tool = "claude"
+default_project = "n8n-workflows"
+
+# ── AI Tool Definitions ──────────────────────────────────────────────
+# Each tool has a launch command, config target, and history source.
+
+[tools.claude]
+launch = "claude"
+config_target = "CLAUDE.md"             # File generated per project root
+history_source = "~/.claude/projects/-mnt-c-Users-ashok-palle/*.jsonl"
+adapter = "adapters/claude/generate.sh"
+
+[tools.kilocode]
+launch = "kilocode"
+config_target = ".kilocode/rules/rules.md"
+memory_bank = ".kilocode/rules/memory-bank/"
+history_source = "~/.local/state/kilo/prompt-history.jsonl"
+adapter = "adapters/kilocode/generate.sh"
+sync_script = "adapters/kilocode/sync-memory-bank.sh"
+# Model aliases (match ~/.bashrc)
+[tools.kilocode.models]
+arch = "amazon-bedrock/us.anthropic.claude-opus-4-6-v1"
+code = "amazon-bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+quick = "amazon-bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0"
+review = "amazon-bedrock/us.anthropic.claude-sonnet-4-20250514-v1:0"
+
+# Reasoning effort per role (kilo run --variant). Empty = provider default.
+# Values: high, max, minimal (provider-specific)
+[tools.kilocode.variants]
+arch = "high"
+code = ""
+quick = "minimal"
+review = ""
+
+[tools.cline]
+launch = "cline"
+config_target = ".clinerules"
+adapter = "adapters/cline/generate.sh"
+
+[tools.codex]
+launch = "codex"
+config_target = "AGENTS.md"
+history_source = "~/.codex/history.jsonl"
+adapter = "adapters/codex/generate.sh"
+
+[tools.ralph]
+launch = "ralph"
+config_target = "progress.md"
+adapter = "adapters/ralph/sync-progress.sh"
+
+# ── Project Definitions ──────────────────────────────────────────────
+# Each project has a path and optional context overlay.
+
+[projects.n8n-workflows]
+path = "/mnt/c/Users/ashok.palle/n8n-workflows"
+context_overlay = "context/projects/n8n-workflows"
+description = "Production DevOps automation — parent-child workflow pattern"
+tags = ["n8n", "devops", "production"]
+
+[projects.n8n-agentic-devops]
+path = "/mnt/c/Users/ashok.palle/n8n-agentic-devops"
+context_overlay = "context/projects/n8n-agentic-devops"
+description = "Multi-agent architecture — 7 specialized agents via Redis pub/sub"
+tags = ["n8n", "agents", "redis"]
+
+[projects.n8n-devops-automation]
+path = "/mnt/c/Users/ashok.palle/n8n-devops-automation"
+context_overlay = "context/projects/n8n-devops-automation"
+description = "Infrastructure monitoring with full observability stack"
+tags = ["n8n", "monitoring", "docker"]
+
+[projects.agentcore-devops-demo]
+path = "/mnt/c/Users/ashok.palle/agentcore-devops-demo"
+context_overlay = "context/projects/agentcore-devops-demo"
+description = "AWS Bedrock AgentCore Python demo"
+tags = ["aws", "bedrock", "python"]
+
+# ── Auto-Detection ──────────────────────────────────────────────────
+# Controls `aiw start auto [project]` behavior.
+
+[auto_detect]
+enabled = "true"
+default_role = "code"
+show_signals = "true"
+
+# Per-project overrides (uncomment to force a role, bypasses all detection)
+# [auto_detect.overrides]
+# n8n-workflows = "code"
+# agentcore-devops-demo = "arch"
+
+# ── Skill Sources ────────────────────────────────────────────────────
+
+[skills]
+catalog = "skills/catalog.json"
+
+# External skill marketplaces (reference for aiw skill search / upgrades)
+[skills.marketplaces]
+pdi_ado = "https://pdidev.visualstudio.com/PDI%20World/_git/pdi-claude-skills-market"
+anthropic = "https://github.com/anthropics/skills/tree/main/skills"
+smithery = "https://smithery.ai/skills"
+skillsllm = "https://skillsllm.com/"
+skillsmp = "https://skillsmp.com/"
+
+[skills.sources.plugins]
+path = "/mnt/c/Users/ashok.palle/.claude/skills/.claude-plugin"
+type = "claude-plugin"
+symlink = "skills/plugins"
+
+[skills.sources.ralph]
+path = "/home/ashokpalle/.agents/skills"
+type = "ralph-skill"
+symlink = "skills/ralph"
+
+[skills.sources.project-skills]
+path = "/mnt/c/Users/ashok.palle/n8n-workflows/.claude/skills"
+type = "claude-project"
+
+# ── History ──────────────────────────────────────────────────────────
+
+[history]
+retention_days = 90
+compress_after_days = 90
+cleanup_generated_days = 30

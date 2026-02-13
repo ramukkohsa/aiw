@@ -1,0 +1,1302 @@
+#!/usr/bin/env bash
+# aiw — Unified AI Workspace CLI
+# Manages shared context, skills, sessions, and tool switching.
+# Install: ln -sf ~/.ai-workspace/bin/aiw ~/.local/bin/aiw
+
+set -euo pipefail
+
+VERSION="1.0.0"
+WORKSPACE="${HOME}/.ai-workspace"
+CONFIG="${WORKSPACE}/config.toml"
+ADAPTERS="${WORKSPACE}/adapters"
+SESSIONS="${WORKSPACE}/sessions"
+
+# ── Colors ──
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+# ── Helpers ──
+
+info()  { echo -e "${BLUE}[aiw]${NC} $*"; }
+ok()    { echo -e "${GREEN}[aiw]${NC} $*"; }
+warn()  { echo -e "${YELLOW}[aiw]${NC} $*"; }
+err()   { echo -e "${RED}[aiw]${NC} $*" >&2; }
+
+check_workspace() {
+    if [ ! -d "$WORKSPACE" ]; then
+        err "Workspace not found at ${WORKSPACE}"
+        err "Run the setup script first."
+        exit 1
+    fi
+    if [ ! -f "$CONFIG" ]; then
+        err "Config not found at ${CONFIG}"
+        exit 1
+    fi
+}
+
+# Get config value: config_get "workspace" "default_tool"
+config_get() {
+    local section="$1"
+    local key="$2"
+    sed -n "/^\[${section}\]/,/^\[/p" "$CONFIG" | grep "^${key}" | head -1 | sed 's/.*= *"//' | sed 's/".*//'
+}
+
+# Get model ID for a KiloCode role (arch/code/quick/review)
+config_get_model() {
+    local role="$1"
+    config_get "tools.kilocode.models" "$role"
+}
+
+# Get variant (reasoning effort) for a KiloCode role
+config_get_variant() {
+    local role="$1"
+    config_get "tools.kilocode.variants" "$role"
+}
+
+# Get project path from config
+project_path() {
+    local project="$1"
+    grep -A5 "\\[projects\\.${project}\\]" "$CONFIG" | grep "^path" | head -1 | sed 's/.*= *"//' | sed 's/".*//'
+}
+
+# List all project names
+list_projects() {
+    grep '^\[projects\.' "$CONFIG" | sed 's/\[projects\.\(.*\)\]/\1/'
+}
+
+# Get default project
+default_project() {
+    config_get "defaults" "default_project"
+}
+
+# Get default tool
+default_tool() {
+    config_get "defaults" "default_tool"
+}
+
+# ── Auto-Detection ──
+
+# Detect best KiloCode role for a project using heuristic signal scoring.
+# Outputs role name (arch/code/quick/review) to stdout, signal details to stderr.
+auto_detect_role() {
+    local project="${1:?Usage: auto_detect_role <project>}"
+    local path
+    path=$(project_path "$project")
+
+    if [ -z "$path" ] || [ ! -d "$path" ]; then
+        err "Project path not found for ${project}"
+        echo "code"
+        return
+    fi
+
+    # Check config overrides first
+    local override
+    override=$(config_get "auto_detect.overrides" "$project")
+    if [ -n "$override" ]; then
+        echo -e "  ${DIM}override: ${project} = ${override}${NC}" >&2
+        echo "$override"
+        return
+    fi
+
+    local enabled
+    enabled=$(config_get "auto_detect" "enabled")
+    if [ "$enabled" = "false" ]; then
+        local default_role
+        default_role=$(config_get "auto_detect" "default_role")
+        echo -e "  ${DIM}auto_detect disabled, using default: ${default_role:-code}${NC}" >&2
+        echo "${default_role:-code}"
+        return
+    fi
+
+    # Score accumulators
+    local score_arch=0 score_code=5 score_quick=0 score_review=0
+    local signals=""
+
+    # ── Tier 1: Git state ──
+    if git -C "$path" rev-parse --is-inside-work-tree &>/dev/null; then
+        # Branch name keywords
+        local branch
+        branch=$(git -C "$path" symbolic-ref --short HEAD 2>/dev/null || echo "")
+        if [ -n "$branch" ]; then
+            case "$branch" in
+                *fix*|*typo*|*hotfix*|*patch*)
+                    score_quick=$((score_quick + 30))
+                    signals="${signals}\n        branch: \"${branch}\" → quick (+30)" ;;
+                *feat*|*add*|*impl*|*build*)
+                    score_code=$((score_code + 20))
+                    signals="${signals}\n        branch: \"${branch}\" → code (+20)" ;;
+                *rfc*|*design*|*arch*|*plan*)
+                    score_arch=$((score_arch + 30))
+                    signals="${signals}\n        branch: \"${branch}\" → arch (+30)" ;;
+                *review*|*audit*|*test*)
+                    score_review=$((score_review + 30))
+                    signals="${signals}\n        branch: \"${branch}\" → review (+30)" ;;
+            esac
+        fi
+
+        # Diff stat: count changed files and lines
+        local diff_files diff_lines
+        diff_files=$(git -C "$path" diff --stat HEAD 2>/dev/null | tail -1 | grep -oP '\d+ file' | grep -oP '\d+' || echo "0")
+        diff_lines=$(git -C "$path" diff --stat HEAD 2>/dev/null | tail -1 | grep -oP '\d+ insertion' | grep -oP '\d+' || echo "0")
+        if [ "$diff_files" = "0" ] && [ -z "$(git -C "$path" diff --name-only HEAD 2>/dev/null)" ]; then
+            score_arch=$((score_arch + 10))
+            signals="${signals}\n        diff: 0 files changed → arch (+10)"
+        elif [ "$diff_files" -le 3 ] 2>/dev/null && [ "$diff_lines" -lt 50 ] 2>/dev/null; then
+            score_quick=$((score_quick + 15))
+            signals="${signals}\n        diff: ${diff_files} files, ${diff_lines} lines → quick (+15)"
+        else
+            score_code=$((score_code + 10))
+            signals="${signals}\n        diff: ${diff_files} files → code (+10)"
+        fi
+
+        # Recent commits (24h) — keyword scan
+        local recent_msgs
+        recent_msgs=$(git -C "$path" log --since="24 hours ago" --pretty=format:"%s" 2>/dev/null | head -10)
+        if [ -n "$recent_msgs" ]; then
+            if echo "$recent_msgs" | grep -qiE 'fix|typo|hotfix|patch'; then
+                score_quick=$((score_quick + 10))
+                signals="${signals}\n        commits: fix/typo keywords → quick (+10)"
+            elif echo "$recent_msgs" | grep -qiE 'feat|add|implement|build'; then
+                score_code=$((score_code + 10))
+                signals="${signals}\n        commits: feat/build keywords → code (+10)"
+            elif echo "$recent_msgs" | grep -qiE 'refactor|design|architect|rfc'; then
+                score_arch=$((score_arch + 10))
+                signals="${signals}\n        commits: design/refactor keywords → arch (+10)"
+            elif echo "$recent_msgs" | grep -qiE 'review|test|validate|audit'; then
+                score_review=$((score_review + 10))
+                signals="${signals}\n        commits: review/test keywords → review (+10)"
+            fi
+        fi
+
+        # Uncommitted file types
+        local changed_files
+        changed_files=$(git -C "$path" diff --name-only 2>/dev/null; git -C "$path" diff --cached --name-only 2>/dev/null)
+        if [ -n "$changed_files" ]; then
+            local has_code=false has_test=false has_md_only=true
+            while IFS= read -r f; do
+                case "$f" in
+                    *.md) ;;
+                    *test*|*spec*) has_test=true; has_md_only=false ;;
+                    *) has_code=true; has_md_only=false ;;
+                esac
+            done <<< "$changed_files"
+            if [ "$has_md_only" = true ]; then
+                score_quick=$((score_quick + 10))
+                signals="${signals}\n        files: only .md → quick (+10)"
+            elif [ "$has_test" = true ]; then
+                score_review=$((score_review + 10))
+                signals="${signals}\n        files: test files → review (+10)"
+            elif [ "$has_code" = true ]; then
+                score_code=$((score_code + 10))
+                signals="${signals}\n        files: code files → code (+10)"
+            fi
+        fi
+    else
+        signals="${signals}\n        git: not a repo (skipped)"
+    fi
+
+    # ── Tier 2: Brief content ──
+    local proj_brief="${WORKSPACE}/context/projects/${project}/brief.md"
+    if [ -f "$proj_brief" ]; then
+        local brief_head
+        brief_head=$(head -c 500 "$proj_brief")
+        if echo "$brief_head" | grep -qiE 'architect|design|rfc|complex|multi.?agent'; then
+            score_arch=$((score_arch + 15))
+            signals="${signals}\n        brief: architecture/design keywords → arch (+15)"
+        fi
+        if echo "$brief_head" | grep -qiE 'implement|build|feature|develop|migration'; then
+            score_code=$((score_code + 10))
+            signals="${signals}\n        brief: implement/build keywords → code (+10)"
+        fi
+        if echo "$brief_head" | grep -qiE 'fix|typo|tweak|minor|simple'; then
+            score_quick=$((score_quick + 10))
+            signals="${signals}\n        brief: fix/typo keywords → quick (+10)"
+        fi
+        if echo "$brief_head" | grep -qiE 'review|validate|audit|test|coverage'; then
+            score_review=$((score_review + 10))
+            signals="${signals}\n        brief: review/validate keywords → review (+10)"
+        fi
+        if echo "$brief_head" | grep -qiE 'production|stability|maintain|operational'; then
+            score_code=$((score_code + 5))
+            signals="${signals}\n        brief: production/stability → code (+5)"
+        fi
+    fi
+
+    # Stuck.md active blockers → arch
+    local stuck="${WORKSPACE}/context/stuck.md"
+    if [ -f "$stuck" ] && ! grep -q "^_No active blockers" "$stuck" && grep -q "^## STUCK-" "$stuck"; then
+        score_arch=$((score_arch + 5))
+        signals="${signals}\n        stuck: active blockers → arch (+5)"
+    fi
+
+    # ── Tier 3: Project config ──
+    local tags
+    tags=$(grep -A10 "\\[projects\\.${project}\\]" "$CONFIG" | grep "^tags" | head -1 | sed 's/tags *= *//')
+    if [ -n "$tags" ]; then
+        if echo "$tags" | grep -qiE 'production'; then
+            score_code=$((score_code + 5))
+            signals="${signals}\n        tags: production → code (+5)"
+        fi
+        if echo "$tags" | grep -qiE 'agents|architecture'; then
+            score_arch=$((score_arch + 5))
+            signals="${signals}\n        tags: agents/architecture → arch (+5)"
+        fi
+        if echo "$tags" | grep -qiE 'monitoring'; then
+            score_review=$((score_review + 3))
+            signals="${signals}\n        tags: monitoring → review (+3)"
+        fi
+    fi
+
+    # File structure hints
+    if [ -d "${path}/src" ]; then
+        local has_tests=false
+        if find "$path" -maxdepth 3 -name "*test*" -o -name "*spec*" 2>/dev/null | head -1 | grep -q .; then
+            has_tests=true
+        fi
+        if [ "$has_tests" = true ]; then
+            score_code=$((score_code + 3))
+            signals="${signals}\n        structure: src/ + tests → code (+3)"
+        fi
+    fi
+
+    # ── Tier 4: Session history ──
+    local today
+    today=$(date +%Y-%m-%d)
+    local session_dir="${WORKSPACE}/history/sessions/${today}"
+    if [ -d "$session_dir" ]; then
+        local last_kilo_session=""
+        last_kilo_session=$(find "$session_dir" -name "kilo-*_*.json" -o -name "kilo_*.json" 2>/dev/null | sort | tail -1)
+        if [ -n "$last_kilo_session" ]; then
+            local sess_tool sess_project sess_started
+            sess_tool=$(python3 -c "import json; print(json.load(open('${last_kilo_session}'))['tool'])" 2>/dev/null || echo "")
+            sess_project=$(python3 -c "import json; print(json.load(open('${last_kilo_session}'))['project'])" 2>/dev/null || echo "")
+            sess_started=$(python3 -c "import json; print(json.load(open('${last_kilo_session}')).get('started',''))" 2>/dev/null || echo "")
+
+            if [ "$sess_project" = "$project" ] && [ -n "$sess_tool" ] && [ -n "$sess_started" ]; then
+                # Check if within 4 hours
+                local sess_epoch now_epoch
+                sess_epoch=$(date -d "$sess_started" +%s 2>/dev/null || echo "0")
+                now_epoch=$(date +%s)
+                local diff_secs=$(( now_epoch - sess_epoch ))
+
+                if [ "$diff_secs" -lt 14400 ] && [ "$diff_secs" -ge 0 ]; then
+                    local sess_role="${sess_tool#kilo-}"
+                    case "$sess_role" in
+                        arch)   score_arch=$((score_arch + 8));     signals="${signals}\n        session: ${sess_tool} ${diff_secs}s ago → arch (+8)" ;;
+                        code)   score_code=$((score_code + 8));     signals="${signals}\n        session: ${sess_tool} ${diff_secs}s ago → code (+8)" ;;
+                        quick)  score_quick=$((score_quick + 5));   signals="${signals}\n        session: ${sess_tool} ${diff_secs}s ago → quick (+5)" ;;
+                        review) score_review=$((score_review + 8)); signals="${signals}\n        session: ${sess_tool} ${diff_secs}s ago → review (+8)" ;;
+                    esac
+                fi
+            fi
+        fi
+    fi
+
+    # ── Determine winner ──
+    # Tie-breaking priority: code > arch > review > quick
+    local best_role="code"
+    local best_score=$score_code
+
+    if [ $score_arch -gt $best_score ]; then
+        best_role="arch"; best_score=$score_arch
+    fi
+    # arch beats code on tie (code already set as default)
+    if [ $score_arch -eq $best_score ] && [ "$best_role" = "code" ] && [ $score_arch -gt $score_code ]; then
+        best_role="arch"; best_score=$score_arch
+    fi
+    if [ $score_review -gt $best_score ]; then
+        best_role="review"; best_score=$score_review
+    fi
+    if [ $score_quick -gt $best_score ]; then
+        best_role="quick"; best_score=$score_quick
+    fi
+
+    # Confidence level
+    local scores=($score_arch $score_code $score_quick $score_review)
+    local second_best=0
+    for s in "${scores[@]}"; do
+        if [ "$s" != "$best_score" ] && [ "$s" -gt "$second_best" ]; then
+            second_best=$s
+        fi
+    done
+    local margin=$((best_score - second_best))
+    local confidence="guess"
+    if [ $margin -ge 20 ]; then confidence="high"
+    elif [ $margin -ge 10 ]; then confidence="medium"
+    elif [ $margin -ge 5 ]; then confidence="low"
+    fi
+
+    # Output signals to stderr
+    local show_signals
+    show_signals=$(config_get "auto_detect" "show_signals")
+    if [ "$show_signals" != "false" ]; then
+        echo -e "${BLUE}[aiw]${NC} Auto-detecting role for ${BOLD}${project}${NC}..." >&2
+        echo -e "${BLUE}[aiw]${NC} Signals:${signals}" >&2
+        echo -e "${BLUE}[aiw]${NC} Scores: arch=${score_arch}  code=${score_code}  quick=${score_quick}  review=${score_review}" >&2
+        echo -e "${BLUE}[aiw]${NC} → ${GREEN}kilo-${best_role}${NC} (confidence: ${confidence})" >&2
+    fi
+
+    # Return role name to stdout
+    echo "$best_role"
+}
+
+# ── Commands ──
+
+cmd_sync() {
+    local project="${1:-}"
+
+    info "Syncing workspace..."
+
+    # Fix line endings first (WSL/Windows compatibility)
+    find "$WORKSPACE" -type f \( -name "*.sh" -o -name "*.toml" -o -name "*.md" \) -exec sed -i 's/\r$//' {} + 2>/dev/null || true
+
+    local adapters=("claude" "codex" "kilocode" "cline")
+
+    for adapter in "${adapters[@]}"; do
+        local script="${ADAPTERS}/${adapter}/generate.sh"
+        if [ -f "$script" ]; then
+            if [ -n "$project" ]; then
+                bash "$script" "$project" 2>/dev/null && ok "${adapter}: ${project}" || warn "${adapter}: ${project} skipped"
+            else
+                bash "$script" 2>/dev/null && ok "${adapter}: all projects" || warn "${adapter}: some projects skipped"
+            fi
+        fi
+    done
+
+    # Sync Ralph if project specified
+    if [ -n "$project" ]; then
+        local ralph_script="${ADAPTERS}/ralph/sync-progress.sh"
+        if [ -f "$ralph_script" ]; then
+            bash "$ralph_script" "$project" --push 2>/dev/null && ok "ralph: ${project}" || true
+        fi
+    fi
+
+    # Regenerate skill catalog
+    local catalog_script="${WORKSPACE}/skills/generate-catalog.py"
+    if [ -f "$catalog_script" ]; then
+        python3 "$catalog_script" 2>/dev/null && ok "skill catalog regenerated" || warn "skill catalog generation failed"
+    fi
+
+    ok "Sync complete."
+}
+
+cmd_status() {
+    echo -e "${BOLD}${CYAN}Unified AI Workspace v${VERSION}${NC}"
+    echo ""
+
+    # Current session
+    local session_file="${SESSIONS}/current.json"
+    if [ -f "$session_file" ]; then
+        echo -e "${BOLD}Active Session:${NC}"
+        python3 -c "
+import json
+with open('${session_file}') as f:
+    s = json.load(f)
+print(f'  Tool:    {s.get(\"tool\", \"none\")}')
+print(f'  Project: {s.get(\"project\", \"none\")}')
+print(f'  Started: {s.get(\"started\", \"unknown\")}')
+print(f'  Status:  {s.get(\"status\", \"unknown\")}')
+" 2>/dev/null || echo "  No active session"
+    else
+        echo -e "${DIM}No active session.${NC}"
+    fi
+    echo ""
+
+    # Brief summary
+    local brief="${WORKSPACE}/context/brief.md"
+    if [ -f "$brief" ]; then
+        echo -e "${BOLD}Current Brief:${NC}"
+        # Show first content paragraph (skip headers and blank lines)
+        sed -n '/^## Current Focus/,/^## /p' "$brief" | head -5 | grep -v '^##' | grep -v '^$' | sed 's/^/  /'
+        echo ""
+    fi
+
+    # Stuck points
+    local stuck="${WORKSPACE}/context/stuck.md"
+    if [ -f "$stuck" ] && ! grep -q "^_No active blockers" "$stuck"; then
+        echo -e "${BOLD}${RED}Blockers:${NC}"
+        grep "^## STUCK-" "$stuck" | sed 's/^/  /' || echo "  None"
+        echo ""
+    fi
+
+    # Projects
+    echo -e "${BOLD}Projects:${NC}"
+    for proj in $(list_projects); do
+        local path
+        path=$(project_path "$proj")
+        local marker=""
+        if [ "$(default_project)" = "$proj" ]; then
+            marker=" ${GREEN}(default)${NC}"
+        fi
+        echo -e "  ${proj}${marker} — ${path}"
+    done
+    echo ""
+
+    # Tools
+    echo -e "${BOLD}Tools:${NC}"
+    echo "  claude, kilocode, cline, codex, ralph"
+    echo ""
+
+    # Skills count
+    local catalog="${WORKSPACE}/skills/catalog.json"
+    if [ -f "$catalog" ]; then
+        local count
+        count=$(python3 -c "import json; print(len(json.load(open('${catalog}'))))" 2>/dev/null || echo "?")
+        echo -e "${BOLD}Skills:${NC} ${count} in catalog"
+    fi
+}
+
+cmd_start() {
+    local tool="${1:-$(default_tool)}"
+    local project="${2:-$(default_project)}"
+
+    # Handle auto-detection: detect role, then recurse with the real tool
+    if [ "$tool" = "auto" ]; then
+        local detected_role
+        detected_role=$(auto_detect_role "$project")
+        echo ""
+        cmd_start "kilo-${detected_role}" "$project"
+        return $?
+    fi
+
+    info "Starting ${tool} on ${project}..."
+
+    # Check for stale session (crash recovery)
+    local session_file="${SESSIONS}/current.json"
+    if [ -f "$session_file" ]; then
+        local stale_tool stale_project stale_started
+        stale_tool=$(python3 -c "import json; print(json.load(open('${session_file}'))['tool'])" 2>/dev/null || echo "unknown")
+        stale_project=$(python3 -c "import json; print(json.load(open('${session_file}'))['project'])" 2>/dev/null || echo "unknown")
+        stale_started=$(python3 -c "import json; print(json.load(open('${session_file}')).get('started','?')[:19])" 2>/dev/null || echo "?")
+        warn "Found stale session: ${stale_tool} on ${stale_project} (started ${stale_started})"
+        warn "Previous session likely ended uncleanly (crash/hangup/power off)."
+        info "Archiving stale session and starting fresh..."
+        bash "${ADAPTERS}/_shared/session-logger.sh" --end 2>/dev/null || rm -f "$session_file"
+    fi
+
+    # Sync context first
+    cmd_sync "$project" 2>/dev/null
+
+    # Record session
+    bash "${ADAPTERS}/_shared/session-logger.sh" --start "$tool" "$project"
+
+    # Resolve project path
+    local path
+    path=$(project_path "$project")
+
+    if [ -z "$path" ] || [ ! -d "$path" ]; then
+        err "Project path not found for ${project}"
+        return 1
+    fi
+
+    # Set up trap to clean up session on ANY exit (crash, Ctrl+C, hangup, kill)
+    cleanup_session() {
+        bash "${ADAPTERS}/_shared/session-logger.sh" --end 2>/dev/null || true
+    }
+    trap cleanup_session EXIT INT TERM HUP
+
+    # Launch tool
+    case "$tool" in
+        claude)
+            ok "Launching Claude Code in ${path}"
+            ok "Chat history auto-saved to: ~/.claude/projects/"
+            echo -e "${DIM}cd ${path} && claude${NC}"
+            cd "$path" && claude
+            ;;
+        kilocode|kilo-arch|kilo-code|kilo-quick|kilo-review)
+            local model="" variant="" variant_flag=""
+            case "$tool" in
+                kilo-arch)
+                    model="--model $(config_get_model 'arch')"
+                    variant=$(config_get_variant 'arch')
+                    ;;
+                kilo-code)
+                    model="--model $(config_get_model 'code')"
+                    variant=$(config_get_variant 'code')
+                    ;;
+                kilo-quick)
+                    model="--model $(config_get_model 'quick')"
+                    variant=$(config_get_variant 'quick')
+                    ;;
+                kilo-review)
+                    model="--model $(config_get_model 'review')"
+                    variant=$(config_get_variant 'review')
+                    ;;
+                kilocode)    model="" ;;  # Use default
+            esac
+            # Build variant flag (only used if non-empty)
+            if [ -n "$variant" ]; then
+                variant_flag="--variant ${variant}"
+            fi
+            ok "Launching KiloCode (${tool}) in ${path}"
+            [ -n "$variant" ] && ok "Variant: ${variant} (reasoning effort)"
+            ok "Chat history auto-saved to: ~/.local/state/kilo/"
+            echo -e "${DIM}cd ${path} && kilocode ${model} ${variant_flag}${NC}"
+            cd "$path" && kilocode $model $variant_flag
+            ;;
+        cline)
+            ok "Launching Cline in ${path}"
+            echo -e "${DIM}Open VS Code in ${path} — Cline reads .clinerules automatically${NC}"
+            code "$path"
+            ;;
+        codex)
+            ok "Launching Codex in ${path}"
+            ok "Chat history auto-saved to: ~/.codex/"
+            echo -e "${DIM}cd ${path} && codex${NC}"
+            cd "$path" && codex
+            ;;
+        ralph)
+            ok "Launching Ralph TUI in ${path}"
+            echo -e "${DIM}cd ${path} && ralph${NC}"
+            cd "$path" && ralph
+            ;;
+        *)
+            err "Unknown tool: ${tool}"
+            err "Available: auto, claude, kilocode, kilo-arch, kilo-code, kilo-quick, kilo-review, cline, codex, ralph"
+            trap - EXIT INT TERM HUP  # Remove trap before erroring
+            return 1
+            ;;
+    esac
+
+    # Trap handles cleanup — but also do explicit end in case trap doesn't fire
+    trap - EXIT INT TERM HUP
+    bash "${ADAPTERS}/_shared/session-logger.sh" --end 2>/dev/null || true
+}
+
+cmd_switch() {
+    local new_tool="${1:?Usage: aiw switch <tool>}"
+
+    local session_file="${SESSIONS}/current.json"
+    if [ ! -f "$session_file" ]; then
+        warn "No active session. Use 'aiw start <tool> [project]' instead."
+        return 1
+    fi
+
+    # Read current session
+    local current_tool current_project
+    current_tool=$(python3 -c "import json; print(json.load(open('${session_file}'))['tool'])" 2>/dev/null)
+    current_project=$(python3 -c "import json; print(json.load(open('${session_file}'))['project'])" 2>/dev/null)
+
+    info "Switching from ${current_tool} to ${new_tool} on ${current_project}..."
+
+    # Generate handoff context
+    local handoff="${SESSIONS}/handoff-template.md"
+    local handoff_file="${SESSIONS}/handoff-$(date +%Y%m%d-%H%M%S).md"
+    if [ -f "$handoff" ]; then
+        sed "s/{{FROM_TOOL}}/${current_tool}/g; s/{{TO_TOOL}}/${new_tool}/g; s/{{PROJECT}}/${current_project}/g; s/{{TIMESTAMP}}/$(date -Iseconds)/g" "$handoff" > "$handoff_file"
+        ok "Handoff context: ${handoff_file}"
+    fi
+
+    # End old session, start new one
+    bash "${ADAPTERS}/_shared/session-logger.sh" --end 2>/dev/null || true
+
+    # Launch new tool
+    cmd_start "$new_tool" "$current_project"
+}
+
+cmd_resume() {
+    local tool="${1:-$(default_tool)}"
+
+    local session_file="${SESSIONS}/current.json"
+
+    # Try to find last session — either active or most recent archived
+    local project=""
+    local last_tool=""
+    local last_started=""
+
+    if [ -f "$session_file" ]; then
+        project=$(python3 -c "import json; print(json.load(open('${session_file}'))['project'])" 2>/dev/null)
+        last_tool=$(python3 -c "import json; print(json.load(open('${session_file}'))['tool'])" 2>/dev/null)
+        last_started=$(python3 -c "import json; print(json.load(open('${session_file}')).get('started','?')[:19])" 2>/dev/null)
+    else
+        # Find most recent archived session
+        local latest_archive
+        latest_archive=$(find "${WORKSPACE}/history/sessions" -name "*.json" -type f 2>/dev/null | sort | tail -1)
+        if [ -n "$latest_archive" ]; then
+            project=$(python3 -c "import json; print(json.load(open('${latest_archive}'))['project'])" 2>/dev/null)
+            last_tool=$(python3 -c "import json; print(json.load(open('${latest_archive}'))['tool'])" 2>/dev/null)
+            last_started=$(python3 -c "import json; print(json.load(open('${latest_archive}')).get('started','?')[:19])" 2>/dev/null)
+        fi
+    fi
+
+    if [ -z "$project" ]; then
+        warn "No previous session found. Starting fresh with defaults."
+        cmd_start "$tool"
+        return
+    fi
+
+    echo -e "${BOLD}${CYAN}Resume Context${NC}"
+    echo ""
+    echo -e "  Last session: ${BOLD}${last_tool}${NC} on ${BOLD}${project}${NC} (${last_started})"
+    echo ""
+
+    # Show current brief
+    local proj_brief="${WORKSPACE}/context/projects/${project}/brief.md"
+    if [ -f "$proj_brief" ]; then
+        echo -e "${BOLD}Project Brief:${NC}"
+        sed -n '/^## Current/,/^## [^C]/p' "$proj_brief" | head -8 | sed 's/^/  /'
+        echo ""
+    fi
+
+    # Show stuck points
+    local stuck="${WORKSPACE}/context/stuck.md"
+    if [ -f "$stuck" ] && ! grep -q "^_No active blockers" "$stuck"; then
+        echo -e "${BOLD}${RED}Active Blockers:${NC}"
+        grep "^## STUCK-" "$stuck" | sed 's/^/  /' || true
+        echo ""
+    fi
+
+    # Show last few lines from tool history (what was being discussed)
+    echo -e "${BOLD}Recent Tool History:${NC}"
+    case "$tool" in
+        claude)
+            local claude_hist="${WORKSPACE}/history/sources/claude.jsonl"
+            if [ -f "$claude_hist" ]; then
+                tail -3 "$claude_hist" 2>/dev/null | python3 -c "
+import sys, json
+for line in sys.stdin:
+    try:
+        d = json.loads(line.strip())
+        msg = d.get('message','')[:100] or d.get('query','')[:100] or str(d)[:100]
+        print(f'  {msg}')
+    except: pass
+" 2>/dev/null || echo "  (could not read history)"
+            fi
+            ;;
+        kilocode|kilo-*)
+            local kilo_hist="${WORKSPACE}/history/sources/kilo.jsonl"
+            if [ -f "$kilo_hist" ]; then
+                tail -3 "$kilo_hist" 2>/dev/null | python3 -c "
+import sys, json
+for line in sys.stdin:
+    try:
+        d = json.loads(line.strip())
+        msg = d.get('message','')[:100] or d.get('prompt','')[:100] or str(d)[:100]
+        print(f'  {msg}')
+    except: pass
+" 2>/dev/null || echo "  (could not read history)"
+            fi
+            ;;
+        *)
+            echo "  (no history reader for ${tool})"
+            ;;
+    esac
+    echo ""
+
+    echo -e "${DIM}Paste this into the tool to resume:${NC}"
+    echo ""
+    echo "  I'm resuming work on ${project}. Read CLAUDE.md for full context."
+    echo "  Check the project brief for current goals. Pick up where we left off."
+    echo ""
+
+    info "Launching ${tool} on ${project}..."
+    cmd_start "$tool" "$project"
+}
+
+cmd_brief() {
+    local project="${1:-}"
+    local editor="${EDITOR:-${VISUAL:-vi}}"
+
+    if [ -n "$project" ]; then
+        local brief="${WORKSPACE}/context/projects/${project}/brief.md"
+        if [ -f "$brief" ]; then
+            "$editor" "$brief"
+        else
+            err "No brief.md for project: ${project}"
+            return 1
+        fi
+    else
+        "$editor" "${WORKSPACE}/context/brief.md"
+    fi
+
+    info "Brief updated. Run 'aiw sync' to propagate."
+}
+
+cmd_stuck() {
+    local editor="${EDITOR:-${VISUAL:-vi}}"
+    "$editor" "${WORKSPACE}/context/stuck.md"
+    info "Stuck points updated. Run 'aiw sync' to propagate."
+}
+
+cmd_skill() {
+    local subcmd="${1:-list}"
+    shift 2>/dev/null || true
+
+    case "$subcmd" in
+        list)
+            local tag_filter="${1:-}"
+            local catalog="${WORKSPACE}/skills/catalog.json"
+            if [ ! -f "$catalog" ]; then
+                err "No catalog found. Run 'aiw sync' first."
+                return 1
+            fi
+
+            if [ -n "$tag_filter" ]; then
+                # Strip --tag= prefix if present
+                tag_filter="${tag_filter#--tag=}"
+                python3 -c "
+import json, sys
+tag = '${tag_filter}'
+data = json.load(open('${catalog}'))
+matches = [s for s in data if tag in s.get('tags', [])]
+print(f'Skills matching tag \"{tag}\": {len(matches)}')
+print()
+for s in matches:
+    print(f'  {s[\"name\"]:40s}  [{s[\"source\"]}]  {s[\"description\"][:60]}')
+"
+            else
+                python3 -c "
+import json
+from collections import Counter
+data = json.load(open('${catalog}'))
+print(f'Total skills: {len(data)}')
+print()
+sources = Counter(s['source'] for s in data)
+for src, count in sources.most_common():
+    print(f'  {src:20s}  {count} skills')
+print()
+tags = Counter(t for s in data for t in s.get('tags', []))
+print('Top tags:')
+for tag, count in tags.most_common(15):
+    print(f'  {tag:20s}  {count}')
+"
+            fi
+            ;;
+        add)
+            local path="${1:?Usage: aiw skill add <path>}"
+            if [ ! -f "$path" ]; then
+                err "File not found: ${path}"
+                return 1
+            fi
+            info "Adding skill: ${path}"
+            info "Regenerating catalog..."
+            python3 "${WORKSPACE}/skills/generate-catalog.py"
+            ok "Skill catalog updated."
+            ;;
+        search)
+            local query="${1:?Usage: aiw skill search <query>}"
+            local catalog="${WORKSPACE}/skills/catalog.json"
+            python3 -c "
+import json, sys
+query = '${query}'.lower()
+data = json.load(open('${catalog}'))
+matches = [s for s in data if query in s['name'].lower() or query in s.get('description','').lower()]
+print(f'Found {len(matches)} skills matching \"{query}\":')
+print()
+for s in matches[:20]:
+    tags = ', '.join(s.get('tags', []))
+    print(f'  {s[\"name\"]:40s}  [{tags}]')
+    print(f'    {s[\"description\"][:80]}')
+    print()
+"
+            ;;
+        *)
+            err "Unknown skill command: ${subcmd}"
+            echo "Usage: aiw skill [list|add|search] [args]"
+            ;;
+    esac
+}
+
+cmd_history() {
+    local tool_filter=""
+    local date_filter=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --tool=*) tool_filter="${1#--tool=}" ;;
+            --date=*)
+                date_filter="${1#--date=}"
+                if [ "$date_filter" = "today" ]; then
+                    date_filter=$(date +%Y-%m-%d)
+                fi
+                ;;
+        esac
+        shift
+    done
+
+    local index="${WORKSPACE}/history/index.jsonl"
+    if [ ! -f "$index" ]; then
+        warn "No history index found. History tracking starts after first 'aiw start'."
+        return
+    fi
+
+    python3 -c "
+import json
+tool_filter = '${tool_filter}'
+date_filter = '${date_filter}'
+entries = []
+with open('${index}') as f:
+    for line in f:
+        line = line.strip()
+        if line:
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+
+if tool_filter:
+    entries = [e for e in entries if e.get('tool') == tool_filter]
+if date_filter:
+    entries = [e for e in entries if e.get('date', '').startswith(date_filter)]
+
+print(f'History entries: {len(entries)}')
+for e in entries[-20:]:
+    print(f'  [{e.get(\"timestamp\",\"?\")[:19]}] {e.get(\"tool\",\"?\")} / {e.get(\"project\",\"?\")} — {e.get(\"summary\",\"\")}')
+"
+}
+
+cmd_cleanup() {
+    info "Cleaning up workspace..."
+
+    # Clean old generated output
+    local gen_dir="${WORKSPACE}/output/generated"
+    if [ -d "$gen_dir" ]; then
+        local threshold
+        threshold=$(date -d "30 days ago" +%Y-%m-%d 2>/dev/null || date -v-30d +%Y-%m-%d 2>/dev/null || echo "")
+        if [ -n "$threshold" ]; then
+            local count=0
+            for dir in "${gen_dir}"/*/; do
+                local dirname
+                dirname=$(basename "$dir")
+                if [[ "$dirname" < "$threshold" ]]; then
+                    rm -rf "$dir"
+                    ((count++)) || true
+                fi
+            done
+            ok "Removed ${count} old generated output directories"
+        fi
+    fi
+
+    # Compact history index (remove duplicates)
+    local index="${WORKSPACE}/history/index.jsonl"
+    if [ -f "$index" ]; then
+        local before
+        before=$(wc -l < "$index")
+        sort -u "$index" > "${index}.tmp" && mv "${index}.tmp" "$index"
+        local after
+        after=$(wc -l < "$index")
+        ok "History index: ${before} -> ${after} entries (removed $((before - after)) duplicates)"
+    fi
+
+    ok "Cleanup complete."
+}
+
+cmd_models() {
+    local subcmd="${1:-show}"
+    shift 2>/dev/null || true
+
+    local discover="${ADAPTERS}/_shared/discover-models.sh"
+    local bashrc="${HOME}/.bashrc"
+    local marker_start="# >>> aiw-models-start >>>"
+    local marker_end="# <<< aiw-models-end <<<"
+    local bedrock_prefix="amazon-bedrock/"
+
+    case "$subcmd" in
+        show)
+            # Display current assignments vs latest available
+            echo -e "${BOLD}${CYAN}Model Assignments${NC}"
+            echo ""
+
+            # Current from config.toml
+            local c_arch c_code c_quick c_review
+            c_arch=$(config_get_model 'arch')
+            c_code=$(config_get_model 'code')
+            c_quick=$(config_get_model 'quick')
+            c_review=$(config_get_model 'review')
+
+            # Variants from config.toml
+            local v_arch v_code v_quick v_review
+            v_arch=$(config_get_variant 'arch')
+            v_code=$(config_get_variant 'code')
+            v_quick=$(config_get_variant 'quick')
+            v_review=$(config_get_variant 'review')
+
+            # Latest from Bedrock
+            local latest
+            latest=$(bash "$discover" --json 2>/dev/null) || {
+                err "Could not query Bedrock. Showing config.toml values only."
+                echo ""
+                printf "  ${BOLD}%-8s${NC} %-55s %s\n" "arch" "$c_arch" "${v_arch:-(default)}"
+                printf "  ${BOLD}%-8s${NC} %-55s %s\n" "code" "$c_code" "${v_code:-(default)}"
+                printf "  ${BOLD}%-8s${NC} %-55s %s\n" "quick" "$c_quick" "${v_quick:-(default)}"
+                printf "  ${BOLD}%-8s${NC} %-55s %s\n" "review" "$c_review" "${v_review:-(default)}"
+                return
+            }
+
+            local l_arch l_code l_quick l_review
+            l_arch=$(echo "$latest" | python3 -c "import json,sys; print(json.load(sys.stdin)['arch'])")
+            l_code=$(echo "$latest" | python3 -c "import json,sys; print(json.load(sys.stdin)['code'])")
+            l_quick=$(echo "$latest" | python3 -c "import json,sys; print(json.load(sys.stdin)['quick'])")
+            l_review=$(echo "$latest" | python3 -c "import json,sys; print(json.load(sys.stdin)['review'])")
+
+            printf "  ${BOLD}%-8s %-55s %-55s %-10s %s${NC}\n" "Role" "Current (config.toml)" "Latest (Bedrock)" "Variant" "Status"
+            echo "  $(printf '%0.s─' {1..145})"
+
+            local roles=("arch" "code" "quick" "review")
+            local current_vals=("$c_arch" "$c_code" "$c_quick" "$c_review")
+            local latest_vals=("$l_arch" "$l_code" "$l_quick" "$l_review")
+            local variant_vals=("${v_arch:-(default)}" "${v_code:-(default)}" "${v_quick:-(default)}" "${v_review:-(default)}")
+
+            for i in 0 1 2 3; do
+                local role="${roles[$i]}"
+                local cur="${current_vals[$i]}"
+                local lat="${bedrock_prefix}${latest_vals[$i]}"
+                local var="${variant_vals[$i]}"
+                local status_icon
+                if [ "$cur" = "$lat" ]; then
+                    status_icon="${GREEN}✓ up-to-date${NC}"
+                else
+                    status_icon="${YELLOW}↑ newer available${NC}"
+                fi
+                printf "  %-8s %-55s %-55s %-10s %b\n" "$role" "$cur" "$lat" "$var" "$status_icon"
+            done
+            echo ""
+
+            # Show all available profiles
+            echo -e "${DIM}All active Bedrock profiles:${NC}"
+            bash "$discover" --table 2>/dev/null | tail -n +7
+            ;;
+
+        update)
+            local dry_run=false
+            if [ "${1:-}" = "--dry-run" ]; then
+                dry_run=true
+                shift
+            fi
+
+            info "Discovering latest models from Bedrock..."
+            local latest
+            latest=$(bash "$discover" --json 2>/dev/null) || {
+                err "Could not query Bedrock. Check AWS CLI configuration."
+                return 1
+            }
+
+            local l_arch l_code l_quick l_review
+            l_arch=$(echo "$latest" | python3 -c "import json,sys; print(json.load(sys.stdin)['arch'])")
+            l_code=$(echo "$latest" | python3 -c "import json,sys; print(json.load(sys.stdin)['code'])")
+            l_quick=$(echo "$latest" | python3 -c "import json,sys; print(json.load(sys.stdin)['quick'])")
+            l_review=$(echo "$latest" | python3 -c "import json,sys; print(json.load(sys.stdin)['review'])")
+
+            # Build new config values (with bedrock prefix)
+            local new_arch="${bedrock_prefix}${l_arch}"
+            local new_code="${bedrock_prefix}${l_code}"
+            local new_quick="${bedrock_prefix}${l_quick}"
+            local new_review="${bedrock_prefix}${l_review}"
+
+            # Current values
+            local c_arch c_code c_quick c_review
+            c_arch=$(config_get_model 'arch')
+            c_code=$(config_get_model 'code')
+            c_quick=$(config_get_model 'quick')
+            c_review=$(config_get_model 'review')
+
+            # Show changes
+            local has_changes=false
+            echo ""
+            echo -e "${BOLD}Changes:${NC}"
+            for role in arch code quick review; do
+                local cur new
+                case "$role" in
+                    arch)   cur="$c_arch";   new="$new_arch" ;;
+                    code)   cur="$c_code";   new="$new_code" ;;
+                    quick)  cur="$c_quick";  new="$new_quick" ;;
+                    review) cur="$c_review"; new="$new_review" ;;
+                esac
+                if [ "$cur" != "$new" ]; then
+                    echo -e "  ${role}: ${RED}${cur}${NC} → ${GREEN}${new}${NC}"
+                    has_changes=true
+                else
+                    echo -e "  ${role}: ${DIM}${cur} (unchanged)${NC}"
+                fi
+            done
+            echo ""
+
+            if [ "$has_changes" = false ]; then
+                ok "All models are already up-to-date."
+                return 0
+            fi
+
+            if [ "$dry_run" = true ]; then
+                warn "Dry run — no files modified."
+                return 0
+            fi
+
+            # ── Update config.toml ──
+            info "Updating config.toml..."
+            python3 -c "
+import re, sys
+
+config_path = '${CONFIG}'
+with open(config_path) as f:
+    content = f.read()
+
+# Replace model values in [tools.kilocode.models] section
+models = {
+    'arch': '${new_arch}',
+    'code': '${new_code}',
+    'quick': '${new_quick}',
+    'review': '${new_review}',
+}
+
+# Find the section and replace each key
+in_section = False
+lines = content.split('\n')
+new_lines = []
+for line in lines:
+    if line.strip() == '[tools.kilocode.models]':
+        in_section = True
+        new_lines.append(line)
+        continue
+    if in_section and line.strip().startswith('['):
+        in_section = False
+    if in_section:
+        for key, val in models.items():
+            if line.strip().startswith(key + ' '):
+                line = f'{key} = \"{val}\"'
+                break
+    new_lines.append(line)
+
+with open(config_path, 'w') as f:
+    f.write('\n'.join(new_lines))
+"
+            ok "config.toml updated."
+
+            # ── Update .bashrc aliases ──
+            # Aliases delegate to aiw start (which reads model+variant from config.toml and syncs)
+            info "Updating .bashrc aliases..."
+
+            python3 - "$bashrc" "$marker_start" "$marker_end" << 'BASHRC_PY'
+import re, sys
+
+bashrc_path, m_start, m_end = sys.argv[1], sys.argv[2], sys.argv[3]
+
+# Aliases delegate to aiw start — model+variant read from config.toml at runtime
+alias_block = "\n".join([
+    m_start,
+    "alias kilo-arch='aiw start kilo-arch'",
+    "alias kilo-code='aiw start kilo-code'",
+    "alias kilo-quick='aiw start kilo-quick'",
+    "alias kilo-review='aiw start kilo-review'",
+    "alias kilo-auto='aiw start auto'",
+    m_end,
+])
+
+with open(bashrc_path) as f:
+    content = f.read()
+
+if m_start in content:
+    # Replace between markers (inclusive)
+    pattern = re.escape(m_start) + r".*?" + re.escape(m_end)
+    content = re.sub(pattern, alias_block, content, flags=re.DOTALL)
+else:
+    # Find existing kilo- aliases and wrap them
+    lines = content.split("\n")
+    alias_indices = [i for i, line in enumerate(lines) if line.strip().startswith("alias kilo-")]
+
+    if not alias_indices:
+        content = content.rstrip("\n") + "\n\n" + alias_block + "\n"
+    else:
+        first, last = min(alias_indices), max(alias_indices)
+        # Also grab the comment line above if it exists
+        if first > 0 and "KiloCode CLI" in lines[first - 1]:
+            first -= 1
+        lines[first:last + 1] = [alias_block]
+        content = "\n".join(lines)
+
+with open(bashrc_path, "w") as f:
+    f.write(content)
+BASHRC_PY
+            ok ".bashrc aliases updated."
+            echo -e "${DIM}Run 'source ~/.bashrc' to activate new aliases.${NC}"
+            ;;
+
+        set)
+            local role="${1:?Usage: aiw models set <role> <model-id>}"
+            local model_id="${2:?Usage: aiw models set <role> <model-id>}"
+
+            # Validate role
+            case "$role" in
+                arch|code|quick|review) ;;
+                *) err "Invalid role: ${role}. Must be arch, code, quick, or review."; return 1 ;;
+            esac
+
+            info "Setting ${role} = ${model_id}"
+
+            # Update config.toml
+            python3 -c "
+config_path = '${CONFIG}'
+role = '${role}'
+model_id = '${model_id}'
+
+with open(config_path) as f:
+    content = f.read()
+
+in_section = False
+lines = content.split('\n')
+new_lines = []
+for line in lines:
+    if line.strip() == '[tools.kilocode.models]':
+        in_section = True
+        new_lines.append(line)
+        continue
+    if in_section and line.strip().startswith('['):
+        in_section = False
+    if in_section and line.strip().startswith(role + ' '):
+        line = f'{role} = \"{model_id}\"'
+    new_lines.append(line)
+
+with open(config_path, 'w') as f:
+    f.write('\n'.join(new_lines))
+"
+            ok "config.toml updated: ${role} = ${model_id}"
+            ok "Aliases use 'aiw start' — model read from config.toml at runtime."
+            ;;
+
+        set-variant)
+            local role="${1:?Usage: aiw models set-variant <role> <variant|default>}"
+            local new_variant="${2:?Usage: aiw models set-variant <role> <variant|default>}"
+
+            # Validate role
+            case "$role" in
+                arch|code|quick|review) ;;
+                *) err "Invalid role: ${role}. Must be arch, code, quick, or review."; return 1 ;;
+            esac
+
+            # Validate variant
+            case "$new_variant" in
+                high|max|minimal) ;;
+                default|"") new_variant="" ;;
+                *) err "Invalid variant: ${new_variant}. Must be high, max, minimal, or default."; return 1 ;;
+            esac
+
+            info "Setting variant for ${role} = ${new_variant:-(default)}"
+
+            # Update config.toml [tools.kilocode.variants] section
+            python3 -c "
+config_path = '${CONFIG}'
+role = '${role}'
+variant = '${new_variant}'
+
+with open(config_path) as f:
+    content = f.read()
+
+in_section = False
+lines = content.split('\n')
+new_lines = []
+for line in lines:
+    if line.strip() == '[tools.kilocode.variants]':
+        in_section = True
+        new_lines.append(line)
+        continue
+    if in_section and line.strip().startswith('['):
+        in_section = False
+    if in_section and line.strip().startswith(role + ' '):
+        line = f'{role} = \"{variant}\"'
+    new_lines.append(line)
+
+with open(config_path, 'w') as f:
+    f.write('\n'.join(new_lines))
+"
+            ok "config.toml updated: ${role} variant = ${new_variant:-(default)}"
+            ok "Aliases use 'aiw start' — variant read from config.toml at runtime."
+            ;;
+
+        reset)
+            info "Resetting to auto-detected latest models..."
+            cmd_models update "$@"
+            ;;
+
+        *)
+            err "Unknown models command: ${subcmd}"
+            echo "Usage:"
+            echo "  aiw models                          Show current models and variants"
+            echo "  aiw models update                   Auto-detect latest, update config + aliases"
+            echo "  aiw models update --dry-run         Show what would change"
+            echo "  aiw models set <role> <id>          Pin a specific model to a role"
+            echo "  aiw models set-variant <role> <val> Set reasoning effort (high/max/minimal/default)"
+            echo "  aiw models reset                    Reset to auto-detected latest"
+            return 1
+            ;;
+    esac
+}
+
+cmd_help() {
+    echo -e "${BOLD}${CYAN}aiw${NC} — Unified AI Workspace CLI v${VERSION}"
+    echo ""
+    echo -e "${BOLD}USAGE:${NC}"
+    echo "  aiw <command> [args]"
+    echo ""
+    echo -e "${BOLD}COMMANDS:${NC}"
+    echo "  sync [project]          Regenerate all tool config files from shared context"
+    echo "  status                  Show current session, brief, projects, skills"
+    echo "  start <tool> [project]  Sync context and launch a tool"
+    echo "  start auto [project]    Auto-detect best KiloCode role and launch"
+    echo "  switch <tool>           Handoff current session to another tool"
+    echo "  resume [tool]           Resume last session"
+    echo "  brief [project]         Open brief.md in \$EDITOR"
+    echo "  stuck                   Open stuck.md in \$EDITOR"
+    echo "  skill list [--tag=TAG]  List skills from catalog"
+    echo "  skill search <query>    Search skills by name/description"
+    echo "  skill add <path>        Register skill and regenerate catalog"
+    echo "  models                          Show current models and variants"
+    echo "  models update                   Auto-detect latest models, update config + aliases"
+    echo "  models update --dry-run         Show what would change without writing"
+    echo "  models set <role> <id>          Pin a specific model to a role"
+    echo "  models set-variant <role> <val> Set reasoning effort (high/max/minimal/default)"
+    echo "  models reset                    Reset to auto-detected latest"
+    echo "  history [--tool=X] [--date=Y]  Search unified history"
+    echo "  cleanup                 Remove old outputs, deduplicate history"
+    echo "  version                 Show version"
+    echo "  help                    Show this help"
+    echo ""
+    echo -e "${BOLD}TOOLS:${NC}"
+    echo "  auto, claude, kilocode, kilo-arch, kilo-code, kilo-quick, kilo-review,"
+    echo "  cline, codex, ralph"
+    echo ""
+    echo -e "${BOLD}PROJECTS:${NC}"
+    for proj in $(list_projects 2>/dev/null); do
+        echo "  ${proj}"
+    done
+    echo ""
+    echo -e "${BOLD}EXAMPLES:${NC}"
+    echo "  aiw sync                          # Sync all projects, all tools"
+    echo "  aiw sync n8n-workflows            # Sync one project"
+    echo "  aiw start claude n8n-workflows    # Launch Claude Code with context"
+    echo "  aiw start auto n8n-workflows      # Auto-detect role for project"
+    echo "  aiw start kilo-code               # Launch KiloCode Sonnet 4.5"
+    echo "  aiw switch kilocode               # Handoff to KiloCode"
+    echo "  aiw skill list --tag=n8n          # List n8n skills"
+    echo "  aiw brief n8n-workflows           # Edit project brief"
+    echo "  aiw history --tool=claude --date=today"
+}
+
+# ── Main Dispatch ──
+
+check_workspace
+
+case "${1:-help}" in
+    sync)       shift; cmd_sync "$@" ;;
+    status)     cmd_status ;;
+    start)      shift; cmd_start "$@" ;;
+    switch)     shift; cmd_switch "$@" ;;
+    resume)     shift; cmd_resume "$@" ;;
+    brief)      shift; cmd_brief "$@" ;;
+    stuck)      cmd_stuck ;;
+    skill)      shift; cmd_skill "$@" ;;
+    models)     shift; cmd_models "$@" ;;
+    history)    shift; cmd_history "$@" ;;
+    cleanup)    cmd_cleanup ;;
+    version)    echo "aiw v${VERSION}" ;;
+    help|--help|-h) cmd_help ;;
+    *)
+        err "Unknown command: $1"
+        echo "Run 'aiw help' for usage."
+        exit 1
+        ;;
+esac
