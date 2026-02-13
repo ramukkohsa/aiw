@@ -138,6 +138,10 @@ aiw status
 | `aiw models set <role> <id>` | Pin a specific model to a role |
 | `aiw models set-variant <role> <val>` | Set reasoning effort (high/max/minimal/default) |
 | `aiw models reset` | Reset to auto-detected latest |
+| `aiw start auto [project]` | Auto-detect best tool + model and launch |
+| `aiw routing` | Show recent auto-routing decisions (last 20) |
+| `aiw routing stats` | Show switch frequency per role/tool |
+| `aiw routing clear` | Clear routing decision log |
 | `aiw history --tool=X --date=Y` | Search session history |
 | `aiw cleanup` | Remove old outputs, deduplicate history |
 | `aiw help` | Full help text |
@@ -145,17 +149,48 @@ aiw status
 
 ### Tool Names for `aiw start`
 
-| Name | Tool | Model |
-|------|------|-------|
-| `claude` | Claude Code | Opus 4.6 (default) |
-| `kilocode` | KiloCode | Default model |
-| `kilo-arch` | KiloCode | Opus 4.6 — architecture, design |
-| `kilo-code` | KiloCode | Sonnet 4.5 — implementation |
-| `kilo-quick` | KiloCode | Haiku 4.5 — quick fixes |
-| `kilo-review` | KiloCode | Sonnet 4 — code review |
-| `cline` | Cline (VS Code) | Opens VS Code |
-| `codex` | Codex CLI | Default model |
-| `ralph` | Ralph TUI | Configurable |
+| Name | Tool | Model | Cost Tier |
+|------|------|-------|-----------|
+| `auto` | Auto-detect | Picks best tool + model | varies |
+| `claude` | Claude Code | Opus 4.6 (default) | 5 (highest) |
+| `kilo-arch` | KiloCode | Opus 4.6 — architecture, design | 4 |
+| `kilo-code` | KiloCode | Sonnet 4.5 — implementation | 3 |
+| `kilo-review` | KiloCode | Sonnet 4 — code review | 2 |
+| `kilo-quick` | KiloCode | Haiku 4.5 — quick fixes | 1 (cheapest) |
+| `kilocode` | KiloCode | Default model | 3 |
+| `cline` | Cline (VS Code) | Opens VS Code | 3 |
+| `codex` | Codex CLI | Default model | 2 |
+| `ralph` | Ralph TUI | No LLM | 0 |
+
+### Cross-Tool Auto-Routing
+
+`aiw start auto [project]` picks the best tool across all integrated tools, not just KiloCode roles.
+
+**How it works:**
+
+1. Asks "What are you working on?" (press Enter to skip)
+2. Combines your answer with project signals (git state, branch, brief, tags)
+3. Scores all 8 tool targets and picks the highest
+4. Launches the winning tool with full context sync
+
+**Scoring has two regimes:**
+- **With task description:** User intent is dominant; project signals are scaled to tiebreaker weight (÷3). Margin thresholds are halved since the signal quality is high.
+- **Without task description (Enter):** Project signals run at full strength, same as the original `auto_detect_role()` behavior. Falls back to `kilo-code` as safe default.
+
+**Margin thresholds** prevent spurious tool switches:
+- Claude needs margin ≥ 30 (or ≥ 15 with task description) — it's the most expensive
+- Cross-tool (cline/codex/ralph) needs margin ≥ 25 (or ≥ 12 with task description)
+- Within-KiloCode switches use existing upgrade/downgrade margins (20/10)
+
+**Mid-session escalation:** The KiloCode per-prompt plugin (`~/.config/kilo/plugin.ts`) continuously classifies each prompt. If a prompt mid-session needs a different tool (e.g., you're in `kilo-code` but ask to "deeply trace through this multi-file codebase"), it can fork to Claude Code, Cline, or Codex.
+
+**Configuration:** `~/.ai-workspace/config.toml`
+- `[auto_detect.tool_routing]` — session-start routing (enabled, margins, interactive prompt)
+- `[tools.kilocode.auto_routing]` — mid-session plugin routing (cross_tool_enabled, margins)
+
+**Kill switch:** Set `enabled = "false"` in `[auto_detect.tool_routing]` to revert `aiw start auto` to KiloCode-only role detection.
+
+**All tools remain directly accessible** by their original commands (`kilo`, `claude`, `codex`, `code`) — `aiw` adds context sync and session tracking on top.
 
 ### Auto-Sync Behavior
 
