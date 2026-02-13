@@ -71,6 +71,55 @@ render_context() {
         read_if_exists "$global_stuck"
         echo ""
     fi
+
+    # ── Auto-Routing Context ──
+    local routing_log="${WORKSPACE}/history/routing-decisions.jsonl"
+    if [ -f "$routing_log" ] && [ -s "$routing_log" ]; then
+        local routing_summary
+        routing_summary=$(python3 -c "
+import json
+entries = []
+with open('${routing_log}') as f:
+    for line in f:
+        line = line.strip()
+        if line:
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+if not entries:
+    exit(0)
+recent = entries[-5:]
+switches = [e for e in entries if e.get('action') == 'switch']
+total = len(entries)
+print('## Auto-Routing History')
+print()
+print(f'{total} routing decisions, {len(switches)} switches ({len(switches)*100//total}% rate).')
+print()
+for e in recent:
+    a = e.get('action', '?')
+    ts = e.get('ts', '?')[:19]
+    cur = e.get('current', '?')
+    tgt = e.get('target', '?')
+    m = e.get('margin', 0)
+    c = e.get('confidence', '?')
+    preview = e.get('prompt_preview', '')[:60]
+    if a == 'switch':
+        print(f'- [{ts}] **{cur} → {tgt}** (margin={m}, {c}): {preview}')
+    else:
+        print(f'- [{ts}] {cur} stay (margin={m}, {c}): {preview}')
+if switches:
+    last_switch = switches[-1]
+    print()
+    print(f'Last model switch: **kilo-{last_switch[\"target\"]}** — pick up from there if resuming.')
+" 2>/dev/null)
+        if [ -n "$routing_summary" ]; then
+            echo "---"
+            echo ""
+            echo "$routing_summary"
+            echo ""
+        fi
+    fi
 }
 
 # Resolve project name from a directory path

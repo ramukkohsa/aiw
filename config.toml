@@ -42,6 +42,17 @@ code = ""
 quick = "minimal"
 review = ""
 
+# Per-prompt auto-routing (requires plugin.ts in ~/.config/kilo/)
+[tools.kilocode.auto_routing]
+enabled = "true"
+log_decisions = "true"
+min_switch_margin = "10"
+upgrade_margin = "20"
+downgrade_margin = "10"
+cross_tool_enabled = "true"
+cross_tool_margin = "25"
+claude_upgrade_margin = "30"
+
 [tools.cline]
 launch = "cline"
 config_target = ".clinerules"
@@ -92,6 +103,13 @@ tags = ["aws", "bedrock", "python"]
 enabled = "true"
 default_role = "code"
 show_signals = "true"
+
+# Cross-tool routing: `aiw start auto` picks best tool, not just KiloCode role
+[auto_detect.tool_routing]
+enabled = "true"
+cross_tool_margin = "25"          # Margin needed to switch to a different tool family
+claude_upgrade_margin = "30"      # Higher bar — Claude is most expensive
+interactive_prompt = "true"       # Ask "What are you working on?" at session start
 
 # Per-project overrides (uncomment to force a role, bypasses all detection)
 # [auto_detect.overrides]

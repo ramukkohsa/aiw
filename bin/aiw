@@ -346,6 +346,300 @@ auto_detect_role() {
     echo "$best_role"
 }
 
+# ── Cross-Tool Auto-Detection ──
+
+# Detect best tool (claude, kilo-arch, kilo-code, kilo-quick, kilo-review, cline, codex, ralph)
+# for a project, combining project signals with optional task description.
+# Outputs full tool name to stdout, signal details to stderr.
+auto_detect_tool() {
+    local project="${1:?Usage: auto_detect_tool <project>}"
+    local task_desc="${2:-}"
+
+    local path
+    path=$(project_path "$project")
+
+    if [ -z "$path" ] || [ ! -d "$path" ]; then
+        err "Project path not found for ${project}"
+        echo "kilo-code"
+        return
+    fi
+
+    # Check if cross-tool routing is enabled
+    local routing_enabled
+    routing_enabled=$(config_get "auto_detect.tool_routing" "enabled")
+    if [ "$routing_enabled" = "false" ]; then
+        # Fall back to KiloCode-only detection
+        local role
+        role=$(auto_detect_role "$project")
+        echo "kilo-${role}"
+        return
+    fi
+
+    local cross_tool_margin claude_upgrade_margin
+    cross_tool_margin=$(config_get "auto_detect.tool_routing" "cross_tool_margin")
+    claude_upgrade_margin=$(config_get "auto_detect.tool_routing" "claude_upgrade_margin")
+    cross_tool_margin="${cross_tool_margin:-25}"
+    claude_upgrade_margin="${claude_upgrade_margin:-30}"
+
+    # ── Phase 1: Project signal scoring ──
+    # Get KiloCode role scores by capturing auto_detect_role signals
+    local role_output
+    role_output=$(auto_detect_role "$project" 2>&1)
+    local detected_role
+    detected_role=$(auto_detect_role "$project" 2>/dev/null)
+
+    # Parse role scores from stderr output
+    local raw_kilo_arch=0 raw_kilo_code=0 raw_kilo_quick=0 raw_kilo_review=0
+    local scores_line
+    scores_line=$(echo "$role_output" | grep "Scores:" | head -1)
+    if [ -n "$scores_line" ]; then
+        raw_kilo_arch=$(echo "$scores_line" | grep -oP 'arch=\K\d+' || echo "0")
+        raw_kilo_code=$(echo "$scores_line" | grep -oP 'code=\K\d+' || echo "0")
+        raw_kilo_quick=$(echo "$scores_line" | grep -oP 'quick=\K\d+' || echo "0")
+        raw_kilo_review=$(echo "$scores_line" | grep -oP 'review=\K\d+' || echo "0")
+    fi
+
+    # When user provides a task description, scale project signals down to
+    # tiebreaker weight (÷3) so the task description is the dominant signal.
+    # Without a task description, project signals are used at full strength.
+    local score_kilo_arch score_kilo_code score_kilo_quick score_kilo_review
+    if [ -n "$task_desc" ]; then
+        score_kilo_arch=$((raw_kilo_arch / 3))
+        score_kilo_code=$((raw_kilo_code / 3))
+        score_kilo_quick=$((raw_kilo_quick / 3))
+        score_kilo_review=$((raw_kilo_review / 3))
+    else
+        score_kilo_arch=$raw_kilo_arch
+        score_kilo_code=$raw_kilo_code
+        score_kilo_quick=$raw_kilo_quick
+        score_kilo_review=$raw_kilo_review
+    fi
+
+    # Non-KiloCode tool scores
+    local score_claude=0 score_cline=0 score_codex=0 score_ralph=0
+    local tool_signals=""
+
+    # Project signal weight: full when no task desc, reduced when task desc provided
+    local proj_weight=1
+    if [ -n "$task_desc" ]; then
+        proj_weight=0  # Skip project signals for non-kilo tools when user described their task
+    fi
+
+    # Cline signals: .vscode dir, CSS/TSX files
+    if [ "$proj_weight" -eq 1 ] && [ -d "${path}/.vscode" ]; then
+        score_cline=$((score_cline + 15))
+        tool_signals="${tool_signals}\n        .vscode/ exists → cline (+15)"
+    fi
+    if [ "$proj_weight" -eq 1 ] && git -C "$path" rev-parse --is-inside-work-tree &>/dev/null; then
+        local changed_exts
+        changed_exts=$(git -C "$path" diff --name-only 2>/dev/null; git -C "$path" diff --cached --name-only 2>/dev/null)
+        if echo "$changed_exts" | grep -qiE '\.(css|scss|tsx|jsx)$'; then
+            score_cline=$((score_cline + 15))
+            tool_signals="${tool_signals}\n        css/tsx files changed → cline (+15)"
+        fi
+    fi
+
+    # Cline: project tags contain "ui" or "frontend"
+    if [ "$proj_weight" -eq 1 ]; then
+        local tags
+        tags=$(grep -A10 "\\[projects\\.${project}\\]" "$CONFIG" | grep "^tags" | head -1 | sed 's/tags *= *//')
+        if [ -n "$tags" ]; then
+            if echo "$tags" | grep -qiE '"ui"|"frontend"'; then
+                score_cline=$((score_cline + 10))
+                tool_signals="${tool_signals}\n        tags: ui/frontend → cline (+10)"
+            fi
+        fi
+    fi
+
+    # Codex: no git repo, script-like directory
+    if [ "$proj_weight" -eq 1 ] && ! git -C "$path" rev-parse --is-inside-work-tree &>/dev/null; then
+        score_codex=$((score_codex + 10))
+        tool_signals="${tool_signals}\n        no git repo → codex (+10)"
+    fi
+
+    # Ralph: progress.md recently modified (within 24h)
+    if [ "$proj_weight" -eq 1 ]; then
+        local progress_file="${path}/progress.md"
+        if [ -f "$progress_file" ]; then
+            local prog_mtime
+            prog_mtime=$(stat -c %Y "$progress_file" 2>/dev/null || echo "0")
+            local now_epoch
+            now_epoch=$(date +%s)
+            if [ $((now_epoch - prog_mtime)) -lt 86400 ]; then
+                score_ralph=$((score_ralph + 10))
+                tool_signals="${tool_signals}\n        progress.md recently modified → ralph (+10)"
+            fi
+        fi
+    fi
+
+    # ── Phase 2: Task description scoring ──
+    if [ -n "$task_desc" ]; then
+        # Claude patterns
+        if echo "$task_desc" | grep -qiP 'debug.*complex|multi.?file|full.*stack|deep.*dive'; then
+            score_claude=$((score_claude + 30))
+            tool_signals="${tool_signals}\n        task: claude high pattern → claude (+30)"
+        fi
+        if echo "$task_desc" | grep -qiP 'explain.*codebase|trace.*through|understand.*how'; then
+            score_claude=$((score_claude + 15))
+            tool_signals="${tool_signals}\n        task: claude medium pattern → claude (+15)"
+        fi
+        if echo "$task_desc" | grep -qiP '\bwhy\b|\breason\b|\bthink\b'; then
+            score_claude=$((score_claude + 5))
+            tool_signals="${tool_signals}\n        task: claude low pattern → claude (+5)"
+        fi
+
+        # Cline patterns
+        if echo "$task_desc" | grep -qiP '\bvisual\b|ui.*edit|css.*change|component.*style'; then
+            score_cline=$((score_cline + 30))
+            tool_signals="${tool_signals}\n        task: cline high pattern → cline (+30)"
+        fi
+        if echo "$task_desc" | grep -qiP '\bvscode\b|diff.*view|side.?by.?side'; then
+            score_cline=$((score_cline + 15))
+            tool_signals="${tool_signals}\n        task: cline medium pattern → cline (+15)"
+        fi
+        if echo "$task_desc" | grep -qiP '\bstyle\b|\blayout\b|\btheme\b'; then
+            score_cline=$((score_cline + 5))
+            tool_signals="${tool_signals}\n        task: cline low pattern → cline (+5)"
+        fi
+
+        # Codex patterns
+        if echo "$task_desc" | grep -qiP '\bscript\b|one.?shot|generate.*and.*run|cli.*tool'; then
+            score_codex=$((score_codex + 30))
+            tool_signals="${tool_signals}\n        task: codex high pattern → codex (+30)"
+        fi
+        if echo "$task_desc" | grep -qiP '\bbash\b|\bshell\b|\bcommand\b|\bpipe\b'; then
+            score_codex=$((score_codex + 15))
+            tool_signals="${tool_signals}\n        task: codex medium pattern → codex (+15)"
+        fi
+        if echo "$task_desc" | grep -qiP '\brun\b|\bexecute\b'; then
+            score_codex=$((score_codex + 5))
+            tool_signals="${tool_signals}\n        task: codex low pattern → codex (+5)"
+        fi
+
+        # Ralph patterns
+        if echo "$task_desc" | grep -qiP 'track.*progress|\bprd\b|task.*list|\bmilestone\b'; then
+            score_ralph=$((score_ralph + 30))
+            tool_signals="${tool_signals}\n        task: ralph high pattern → ralph (+30)"
+        fi
+        if echo "$task_desc" | grep -qiP 'plan.*sprint|status.*update|\broadmap\b'; then
+            score_ralph=$((score_ralph + 15))
+            tool_signals="${tool_signals}\n        task: ralph medium pattern → ralph (+15)"
+        fi
+        if echo "$task_desc" | grep -qiP '\bprogress\b|\bbacklog\b'; then
+            score_ralph=$((score_ralph + 5))
+            tool_signals="${tool_signals}\n        task: ralph low pattern → ralph (+5)"
+        fi
+
+        # KiloCode role task description boosters (same keywords from plugin.ts)
+        if echo "$task_desc" | grep -qiP '\barchitect|\bdesign\s+system|\brfc\b|\btrade.?off|\bmulti.?agent'; then
+            score_kilo_arch=$((score_kilo_arch + 25))
+            tool_signals="${tool_signals}\n        task: arch keywords → kilo-arch (+25)"
+        fi
+        if echo "$task_desc" | grep -qiP '\bimplement\b|\bbuild\b|\bcreate\s+.*function|\badd\s+.*feature|\bwrite\s+.*code'; then
+            score_kilo_code=$((score_kilo_code + 25))
+            tool_signals="${tool_signals}\n        task: code keywords → kilo-code (+25)"
+        fi
+        if echo "$task_desc" | grep -qiP '\bfix\s+.*typo|\brename\b|\bhotfix\b|\bpatch\b'; then
+            score_kilo_quick=$((score_kilo_quick + 25))
+            tool_signals="${tool_signals}\n        task: quick keywords → kilo-quick (+25)"
+        fi
+        if echo "$task_desc" | grep -qiP '\breview\s+.*code|\baudit\b|\bfind\s+.*bug|\bsecurity\s+.*check'; then
+            score_kilo_review=$((score_kilo_review + 25))
+            tool_signals="${tool_signals}\n        task: review keywords → kilo-review (+25)"
+        fi
+    fi
+
+    # ── Determine winner across all tools ──
+    # Build associative-style scoring (bash 4+ arrays)
+    local -A all_scores
+    all_scores[claude]=$score_claude
+    all_scores[kilo-arch]=$score_kilo_arch
+    all_scores[kilo-code]=$score_kilo_code
+    all_scores[kilo-quick]=$score_kilo_quick
+    all_scores[kilo-review]=$score_kilo_review
+    all_scores[cline]=$score_cline
+    all_scores[codex]=$score_codex
+    all_scores[ralph]=$score_ralph
+
+    local best_tool="kilo-code"
+    local best_score=${all_scores[kilo-code]}
+
+    for tool_name in claude kilo-arch kilo-code kilo-quick kilo-review cline codex ralph; do
+        if [ "${all_scores[$tool_name]}" -gt "$best_score" ]; then
+            best_tool="$tool_name"
+            best_score="${all_scores[$tool_name]}"
+        fi
+    done
+
+    # Second-best score
+    local second_best=0
+    for tool_name in claude kilo-arch kilo-code kilo-quick kilo-review cline codex ralph; do
+        if [ "$tool_name" != "$best_tool" ] && [ "${all_scores[$tool_name]}" -gt "$second_best" ]; then
+            second_best="${all_scores[$tool_name]}"
+        fi
+    done
+    local margin=$((best_score - second_best))
+
+    # ── Apply margin thresholds ──
+    # When user provided a task description, use halved thresholds —
+    # explicit user intent is a stronger signal than project heuristics.
+    local eff_claude_margin=$claude_upgrade_margin
+    local eff_cross_margin=$cross_tool_margin
+    if [ -n "$task_desc" ]; then
+        eff_claude_margin=$((claude_upgrade_margin / 2))
+        eff_cross_margin=$((cross_tool_margin / 2))
+    fi
+
+    # Claude needs the highest bar
+    if [ "$best_tool" = "claude" ] && [ "$margin" -lt "$eff_claude_margin" ]; then
+        best_tool="kilo-code"
+        best_score=${all_scores[kilo-code]}
+        tool_signals="${tool_signals}\n        margin: claude score below threshold (${margin}<${eff_claude_margin}) → fallback kilo-code"
+    fi
+
+    # Cross-tool switches (non-kilo tools) need minimum margin
+    case "$best_tool" in
+        cline|codex|ralph)
+            if [ "$margin" -lt "$eff_cross_margin" ]; then
+                tool_signals="${tool_signals}\n        margin: ${best_tool} below cross-tool threshold (${margin}<${eff_cross_margin}) → fallback kilo-code"
+                best_tool="kilo-code"
+                best_score=${all_scores[kilo-code]}
+            fi
+            ;;
+    esac
+
+    # Recalculate margin after possible fallback
+    second_best=0
+    for tool_name in claude kilo-arch kilo-code kilo-quick kilo-review cline codex ralph; do
+        if [ "$tool_name" != "$best_tool" ] && [ "${all_scores[$tool_name]}" -gt "$second_best" ]; then
+            second_best="${all_scores[$tool_name]}"
+        fi
+    done
+    margin=$((best_score - second_best))
+
+    # Confidence level
+    local confidence="guess"
+    if [ $margin -ge 20 ]; then confidence="high"
+    elif [ $margin -ge 10 ]; then confidence="medium"
+    elif [ $margin -ge 5 ]; then confidence="low"
+    fi
+
+    # Output signals to stderr
+    local show_signals
+    show_signals=$(config_get "auto_detect" "show_signals")
+    if [ "$show_signals" != "false" ]; then
+        echo -e "${BLUE}[aiw]${NC} Auto-detecting tool for ${BOLD}${project}${NC}..." >&2
+        if [ -n "$task_desc" ]; then
+            echo -e "${BLUE}[aiw]${NC} Task: \"${task_desc}\"" >&2
+        fi
+        echo -e "${BLUE}[aiw]${NC} Tool signals:${tool_signals}" >&2
+        echo -e "${BLUE}[aiw]${NC} Scores: claude=${score_claude}  kilo-arch=${score_kilo_arch}  kilo-code=${score_kilo_code}  kilo-quick=${score_kilo_quick}  kilo-review=${score_kilo_review}  cline=${score_cline}  codex=${score_codex}  ralph=${score_ralph}" >&2
+        echo -e "${BLUE}[aiw]${NC} → ${GREEN}${best_tool}${NC} (confidence: ${confidence}, margin: ${margin})" >&2
+    fi
+
+    echo "$best_tool"
+}
+
 # ── Commands ──
 
 cmd_sync() {
@@ -443,6 +737,41 @@ print(f'  Status:  {s.get(\"status\", \"unknown\")}')
     echo "  claude, kilocode, cline, codex, ralph"
     echo ""
 
+    # Auto-Routing summary
+    local routing_log="${WORKSPACE}/history/routing-decisions.jsonl"
+    if [ -f "$routing_log" ] && [ -s "$routing_log" ]; then
+        echo -e "${BOLD}Auto-Routing:${NC}"
+        python3 -c "
+import json
+entries = []
+with open('${routing_log}') as f:
+    for line in f:
+        line = line.strip()
+        if line:
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+total = len(entries)
+switches = sum(1 for e in entries if e.get('action') == 'switch')
+print(f'  {total} decisions, {switches} switches ({switches*100//total}% rate)' if total else '  No decisions yet')
+for e in entries[-3:]:
+    a = e.get('action', '?')
+    icon = '→' if a == 'switch' else '·'
+    ts = e.get('ts', '?')[11:19]
+    cur = e.get('current', '?')
+    tgt = e.get('target', '?')
+    m = e.get('margin', 0)
+    preview = e.get('prompt_preview', '')[:50]
+    if a == 'switch':
+        print(f'  {icon} {ts} {cur}→{tgt} (margin={m}) {preview}')
+    else:
+        print(f'  {icon} {ts} {cur} stay  (margin={m}) {preview}')
+print(f'  Run \"aiw routing\" for full log.')
+" 2>/dev/null
+        echo ""
+    fi
+
     # Skills count
     local catalog="${WORKSPACE}/skills/catalog.json"
     if [ -f "$catalog" ]; then
@@ -456,12 +785,21 @@ cmd_start() {
     local tool="${1:-$(default_tool)}"
     local project="${2:-$(default_project)}"
 
-    # Handle auto-detection: detect role, then recurse with the real tool
+    # Handle auto-detection: detect best tool + role, then recurse
     if [ "$tool" = "auto" ]; then
-        local detected_role
-        detected_role=$(auto_detect_role "$project")
+        local task_desc=""
+        local interactive
+        interactive=$(config_get "auto_detect.tool_routing" "interactive_prompt")
+        if [ "$interactive" != "false" ]; then
+            echo ""
+            echo -e "${CYAN}What are you working on?${NC} (or press Enter to auto-detect from project signals)"
+            read -r task_desc
+        fi
+
+        local detected_tool
+        detected_tool=$(auto_detect_tool "$project" "$task_desc")
         echo ""
-        cmd_start "kilo-${detected_role}" "$project"
+        cmd_start "${detected_tool}" "$project"
         return $?
     fi
 
@@ -688,6 +1026,43 @@ for line in sys.stdin:
             ;;
     esac
     echo ""
+
+    # Recent routing decisions (if any)
+    local routing_log="${WORKSPACE}/history/routing-decisions.jsonl"
+    if [ -f "$routing_log" ] && [ -s "$routing_log" ]; then
+        echo -e "${BOLD}Recent Auto-Routing:${NC}"
+        python3 -c "
+import json
+entries = []
+with open('${routing_log}') as f:
+    for line in f:
+        line = line.strip()
+        if line:
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+for e in entries[-3:]:
+    a = e.get('action', '?')
+    icon = '→' if a == 'switch' else '·'
+    ts = e.get('ts', '?')[:19]
+    cur = e.get('current', '?')
+    tgt = e.get('target', '?')
+    m = e.get('margin', 0)
+    c = e.get('confidence', '?')
+    preview = e.get('prompt_preview', '')[:50]
+    if a == 'switch':
+        print(f'  {icon} [{ts}] {cur}→{tgt} (margin={m}, {c}) {preview}')
+    else:
+        print(f'  {icon} [{ts}] {cur} stay (margin={m}, {c}) {preview}')
+# Suggest optimal tool based on last routing decision
+if entries:
+    last = entries[-1]
+    if last.get('action') == 'switch':
+        print(f'  Tip: Last prompt was routed to kilo-{last[\"target\"]}. Consider resuming with that role.')
+" 2>/dev/null
+        echo ""
+    fi
 
     echo -e "${DIM}Paste this into the tool to resume:${NC}"
     echo ""
@@ -1236,7 +1611,7 @@ cmd_help() {
     echo "  sync [project]          Regenerate all tool config files from shared context"
     echo "  status                  Show current session, brief, projects, skills"
     echo "  start <tool> [project]  Sync context and launch a tool"
-    echo "  start auto [project]    Auto-detect best KiloCode role and launch"
+    echo "  start auto [project]    Auto-detect best tool + model and launch"
     echo "  switch <tool>           Handoff current session to another tool"
     echo "  resume [tool]           Resume last session"
     echo "  brief [project]         Open brief.md in \$EDITOR"
@@ -1250,6 +1625,9 @@ cmd_help() {
     echo "  models set <role> <id>          Pin a specific model to a role"
     echo "  models set-variant <role> <val> Set reasoning effort (high/max/minimal/default)"
     echo "  models reset                    Reset to auto-detected latest"
+    echo "  routing                         Show recent auto-routing decisions"
+    echo "  routing stats                   Show switch frequency per role"
+    echo "  routing clear                   Clear routing log"
     echo "  history [--tool=X] [--date=Y]  Search unified history"
     echo "  cleanup                 Remove old outputs, deduplicate history"
     echo "  version                 Show version"
@@ -1268,12 +1646,131 @@ cmd_help() {
     echo "  aiw sync                          # Sync all projects, all tools"
     echo "  aiw sync n8n-workflows            # Sync one project"
     echo "  aiw start claude n8n-workflows    # Launch Claude Code with context"
-    echo "  aiw start auto n8n-workflows      # Auto-detect role for project"
+    echo "  aiw start auto n8n-workflows      # Auto-detect best tool + model for project"
     echo "  aiw start kilo-code               # Launch KiloCode Sonnet 4.5"
     echo "  aiw switch kilocode               # Handoff to KiloCode"
     echo "  aiw skill list --tag=n8n          # List n8n skills"
     echo "  aiw brief n8n-workflows           # Edit project brief"
     echo "  aiw history --tool=claude --date=today"
+}
+
+cmd_routing() {
+    local subcmd="${1:-show}"
+    local log_file="${WORKSPACE}/history/routing-decisions.jsonl"
+
+    case "$subcmd" in
+        show)
+            if [ ! -f "$log_file" ]; then
+                warn "No routing decisions logged yet."
+                warn "Routing log will appear after the KiloCode auto-routing plugin processes prompts."
+                return
+            fi
+
+            echo -e "${BOLD}${CYAN}Recent Routing Decisions${NC}"
+            echo ""
+            python3 -c "
+import json, sys
+
+entries = []
+with open('${log_file}') as f:
+    for line in f:
+        line = line.strip()
+        if line:
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+
+for e in entries[-20:]:
+    action = e.get('action', '?')
+    icon = '→' if action == 'switch' else '·'
+    ts = e.get('ts', '?')[:19]
+    current = e.get('current', '?')
+    target = e.get('target', '?')
+    margin = e.get('margin', 0)
+    conf = e.get('confidence', '?')
+    preview = e.get('prompt_preview', '')[:60]
+    scores = e.get('scores', {})
+    score_str = ' '.join(f'{k}={v}' for k, v in scores.items())
+
+    if action == 'switch':
+        print(f'  {icon} [{ts}] {current} → {target}  margin={margin} ({conf})  {preview}')
+    else:
+        print(f'  {icon} [{ts}] {current} (stay)     margin={margin} ({conf})  {preview}')
+"
+            ;;
+
+        stats)
+            if [ ! -f "$log_file" ]; then
+                warn "No routing decisions logged yet."
+                return
+            fi
+
+            echo -e "${BOLD}${CYAN}Routing Statistics${NC}"
+            echo ""
+            python3 -c "
+import json
+from collections import Counter
+
+entries = []
+with open('${log_file}') as f:
+    for line in f:
+        line = line.strip()
+        if line:
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+
+total = len(entries)
+switches = [e for e in entries if e.get('action') == 'switch']
+stays = [e for e in entries if e.get('action') == 'stay']
+
+print(f'  Total decisions:  {total}')
+print(f'  Switches:         {len(switches)}')
+print(f'  Stays:            {len(stays)}')
+if total > 0:
+    print(f'  Switch rate:      {len(switches)*100//total}%')
+print()
+
+if switches:
+    print('  Switch targets:')
+    targets = Counter(e.get('target') for e in switches)
+    for role, count in targets.most_common():
+        print(f'    {role:8s}  {count}')
+    print()
+
+    print('  Switch sources:')
+    sources = Counter(e.get('current') for e in switches)
+    for role, count in sources.most_common():
+        print(f'    {role:8s}  {count}')
+    print()
+
+print('  Confidence distribution:')
+confs = Counter(e.get('confidence') for e in entries)
+for conf, count in confs.most_common():
+    print(f'    {conf:8s}  {count}')
+"
+            ;;
+
+        clear)
+            if [ -f "$log_file" ]; then
+                rm -f "$log_file"
+                ok "Routing log cleared."
+            else
+                info "No routing log to clear."
+            fi
+            ;;
+
+        *)
+            err "Unknown routing command: ${subcmd}"
+            echo "Usage:"
+            echo "  aiw routing               Show recent routing decisions (last 20)"
+            echo "  aiw routing stats          Show switch frequency per role"
+            echo "  aiw routing clear          Clear routing log"
+            return 1
+            ;;
+    esac
 }
 
 # ── Main Dispatch ──
@@ -1290,6 +1787,7 @@ case "${1:-help}" in
     stuck)      cmd_stuck ;;
     skill)      shift; cmd_skill "$@" ;;
     models)     shift; cmd_models "$@" ;;
+    routing)    shift; cmd_routing "$@" ;;
     history)    shift; cmd_history "$@" ;;
     cleanup)    cmd_cleanup ;;
     version)    echo "aiw v${VERSION}" ;;
