@@ -251,11 +251,11 @@ check_tool() {
 
 check_tool "python3" "required"
 check_tool "git" "required"
-check_tool "aws" "recommended"
-check_tool "claude" "optional"
-check_tool "kilo" "optional"
-check_tool "cline" "optional"
-check_tool "codex" "optional"
+check_tool "aws" "recommended" || true
+check_tool "claude" "optional" || true
+check_tool "kilo" "optional" || true
+check_tool "cline" "optional" || true
+check_tool "codex" "optional" || true
 
 # ── Step 9b: Check AWS Bedrock access ──
 if command -v aws &>/dev/null; then
