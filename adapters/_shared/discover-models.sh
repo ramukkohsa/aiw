@@ -61,9 +61,9 @@ NEW_PATTERN = re.compile(
     r"us\.anthropic\.claude-"
     r"(?P<family>opus|sonnet|haiku)-"
     r"(?P<major>\d+)"
-    r"(?:-(?P<minor>\d{1,2}))?"   # minor version: 1-2 digits (optional)
+    r"(?:-(?P<minor>\d)(?!\d))?"  # minor version: exactly 1 digit, not followed by digit
     r"(?:-(?P<date>\d{8}))?"      # date stamp: exactly 8 digits (optional)
-    r"-v(?P<rev>\d+)"             # revision
+    r"(?:-v(?P<rev>\d+))?"        # revision (optional — newer models may omit)
     r"(?::(?P<tag>\d+))?"         # tag (optional)
 )
 
@@ -89,7 +89,7 @@ def parse_model(profile_id):
         major = int(m.group("major"))
         minor = int(m.group("minor")) if m.group("minor") else 0
         date = int(m.group("date")) if m.group("date") else 99999999  # no date = latest
-        rev = int(m.group("rev"))
+        rev = int(m.group("rev")) if m.group("rev") else 99  # no rev = latest
         # Version tuple: higher = newer
         return family, (major, minor, date, rev), profile_id
 

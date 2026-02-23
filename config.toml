@@ -30,9 +30,9 @@ sync_script = "adapters/kilocode/sync-memory-bank.sh"
 # Model aliases (match ~/.bashrc)
 [tools.kilocode.models]
 arch = "amazon-bedrock/us.anthropic.claude-opus-4-6-v1"
-code = "amazon-bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+code = "amazon-bedrock/us.anthropic.claude-sonnet-4-6"
 quick = "amazon-bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0"
-review = "amazon-bedrock/us.anthropic.claude-sonnet-4-20250514-v1:0"
+review = "amazon-bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0"
 
 # Reasoning effort per role (kilo run --variant). Empty = provider default.
 # Values: high, max, minimal (provider-specific)
