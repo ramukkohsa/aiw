@@ -79,7 +79,11 @@ def scan_plugin_skills(base: Path) -> list[dict]:
     for md in sorted(base.rglob("*.md")):
         if md.name in ("README.md", "CHANGELOG.md"):
             continue
-        name = md.stem.replace("-", " ")
+        # Use parent directory name for generic filenames, stem for descriptive ones
+        if md.stem.upper() in ("SKILL", "QUICK-REFERENCE", "INDEX"):
+            name = md.parent.name.replace("-", " ")
+        else:
+            name = md.stem.replace("-", " ")
         desc = extract_description(md)
         tags = tags_from_path(md)
         entries.append({

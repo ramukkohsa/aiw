@@ -1159,9 +1159,12 @@ for tag, count in tags.most_common(15):
             local catalog="${WORKSPACE}/skills/catalog.json"
             python3 -c "
 import json, sys
+import re
 query = '${query}'.lower()
+# Normalize hyphens/underscores to spaces for flexible matching
+query_norm = re.sub(r'[-_]', ' ', query)
 data = json.load(open('${catalog}'))
-matches = [s for s in data if query in s['name'].lower() or query in s.get('description','').lower()]
+matches = [s for s in data if query_norm in re.sub(r'[-_]', ' ', s['name'].lower()) or query in s.get('description','').lower()]
 print(f'Found {len(matches)} skills matching \"{query}\":')
 print()
 for s in matches[:20]:
