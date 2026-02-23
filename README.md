@@ -143,6 +143,8 @@ docker compose version
 
 ### 1. Clone the repo
 
+`aiw` is a single bash script (`bin/aiw`) distributed with this repo. There's no separate package — cloning the repo installs everything.
+
 ```bash
 git clone <repo-url> ~/.ai-workspace
 ```
@@ -158,11 +160,29 @@ This will:
 - Create `config.toml` from the included `config.toml.example` template
 - Prompt for your machine-specific paths (projects directory, skill sources)
 - Create required directories (`sessions/`, `history/`, `output/`, `skills/`)
-- Symlink `aiw` into `~/.local/bin/`
-- Check for installed tools
+- Symlink `aiw` into `~/.local/bin/` (adds it to your PATH)
+- Check for required, recommended, and optional tools
+- Validate AWS Bedrock access
 - Generate the initial skill catalog
 
-### 3. Add your projects
+### 3. Verify aiw is installed
+
+```bash
+# Check it's on your PATH
+aiw version        # Should print: aiw v1.0.0
+
+# If "command not found", ensure ~/.local/bin is in your PATH:
+export PATH="$HOME/.local/bin:$PATH"
+# Add that line to your ~/.bashrc or ~/.zshrc to make it permanent
+
+# Full health check
+aiw status         # Shows workspace, session, projects, skill count
+aiw help           # Full command reference
+```
+
+If `aiw version` works, you're set.
+
+### 4. Add your projects
 
 Edit `~/.ai-workspace/config.toml` and add `[projects.*]` sections for each of your repos:
 
@@ -174,7 +194,7 @@ description = "Brief description"
 tags = ["tag1", "tag2"]
 ```
 
-### 4. Create context and sync
+### 5. Create context and sync
 
 ```bash
 mkdir -p ~/.ai-workspace/context/projects/my-project
@@ -182,7 +202,7 @@ mkdir -p ~/.ai-workspace/context/projects/my-project
 aiw sync
 ```
 
-### 5. Auto-detect models
+### 6. Auto-detect models
 
 If AWS Bedrock is configured (see [AWS CLI v2](#aws-cli-v2) above), run:
 
@@ -202,7 +222,10 @@ If you prefer to set up manually:
 cp ~/.ai-workspace/config.toml.example ~/.ai-workspace/config.toml
 # Edit config.toml — fill in your paths
 mkdir -p ~/.ai-workspace/{sessions,history/sessions,history/sources,output,skills}
+mkdir -p ~/.local/bin
 ln -sf ~/.ai-workspace/bin/aiw ~/.local/bin/aiw
+export PATH="$HOME/.local/bin:$PATH"  # add to ~/.bashrc to persist
+aiw version   # verify: aiw v1.0.0
 aiw sync
 ```
 
