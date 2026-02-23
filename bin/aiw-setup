@@ -42,10 +42,16 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     echo ""
     echo "Prerequisites:"
     echo "  - This repo cloned/copied to ~/.ai-workspace"
-    echo "  - python3 and git installed"
+    echo "  - git, python3, node v18+ / npm (required)"
     echo "  - AWS CLI v2 configured with Bedrock access (recommended)"
     echo "    Needed for KiloCode model routing and 'aiw models update'"
     echo "    Not required if using direct Anthropic API or OpenRouter"
+    echo ""
+    echo "AI tools (install whichever you use):"
+    echo "  npm install -g @anthropic-ai/claude-code   # Claude Code"
+    echo "  npm install -g kilocode                     # KiloCode"
+    echo "  npm install -g @openai/codex                # Codex"
+    echo "  Cline: install via VS Code extension marketplace"
     exit 0
 fi
 
@@ -251,6 +257,8 @@ check_tool() {
 
 check_tool "python3" "required"
 check_tool "git" "required"
+check_tool "node" "required"
+check_tool "npm" "required"
 check_tool "aws" "recommended" || true
 check_tool "claude" "optional" || true
 check_tool "kilo" "optional" || true
