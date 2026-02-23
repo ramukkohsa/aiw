@@ -28,6 +28,7 @@ A hub-and-spoke workspace that shares context, skills, and history across multip
 ### Prerequisites
 
 - `git`, `python3` (required)
+- AWS CLI v2 configured with Bedrock access (required for KiloCode model routing and `aiw models`)
 - One or more AI CLI tools: `claude`, `kilo`, `cline`, `codex` (optional — install whichever you use)
 
 ### 1. Clone the repo
@@ -70,6 +71,31 @@ mkdir -p ~/.ai-workspace/context/projects/my-project
 # Create CONTEXT.md, brief.md, decisions.md (see templates/new-project.md)
 aiw sync
 ```
+
+### 5. AWS Bedrock setup (for KiloCode model routing)
+
+KiloCode models in `config.toml` use AWS Bedrock inference profiles by default (`amazon-bedrock/us.anthropic.claude-*`). This requires:
+
+1. **Install AWS CLI v2** — [docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html](https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html)
+
+2. **Configure credentials** with Bedrock access:
+```bash
+aws configure
+# Or use SSO:
+aws configure sso
+```
+
+3. **Verify Bedrock access:**
+```bash
+aws bedrock list-inference-profiles --region us-east-1 --query 'inferenceProfileSummaries[?contains(inferenceProfileId,`claude`)]' --output table
+```
+
+4. **Auto-detect latest models:**
+```bash
+aiw models update
+```
+
+**Not using Bedrock?** The model IDs in `config.toml` under `[tools.kilocode.models]` can be changed to any provider format that KiloCode supports (e.g., `anthropic/claude-sonnet-4-latest` for direct Anthropic API, or `openrouter/anthropic/claude-sonnet-4` for OpenRouter). Claude Code uses its own model setting independently — configure it via `/model` inside Claude Code or `~/.claude/settings.json`.
 
 ### Manual setup (without the script)
 

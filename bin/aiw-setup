@@ -229,13 +229,15 @@ echo -e "${BOLD}Checking tools:${NC}"
 
 check_tool() {
     local name="$1"
-    local required="${2:-optional}"
+    local level="${2:-optional}"  # required, recommended, optional
     if command -v "$name" &>/dev/null; then
         echo -e "  ${GREEN}✓${NC} ${name}"
         return 0
     else
-        if [ "$required" = "required" ]; then
+        if [ "$level" = "required" ]; then
             echo -e "  ${RED}✗${NC} ${name} ${DIM}(required — please install)${NC}"
+        elif [ "$level" = "recommended" ]; then
+            echo -e "  ${YELLOW}○${NC} ${name} ${DIM}(recommended — needed for Bedrock model routing)${NC}"
         else
             echo -e "  ${YELLOW}○${NC} ${name} ${DIM}(optional)${NC}"
         fi
@@ -245,10 +247,24 @@ check_tool() {
 
 check_tool "python3" "required"
 check_tool "git" "required"
+check_tool "aws" "recommended"
 check_tool "claude" "optional"
 check_tool "kilo" "optional"
 check_tool "cline" "optional"
 check_tool "codex" "optional"
+
+# ── Step 9b: Check AWS Bedrock access ──
+if command -v aws &>/dev/null; then
+    echo ""
+    info "Checking AWS Bedrock access..."
+    if aws bedrock list-inference-profiles --region us-east-1 --max-results 1 &>/dev/null 2>&1; then
+        echo -e "  ${GREEN}✓${NC} AWS Bedrock access confirmed"
+    else
+        echo -e "  ${YELLOW}○${NC} AWS Bedrock ${DIM}(not configured — needed for KiloCode model routing and 'aiw models')${NC}"
+        echo "    Run: aws configure"
+        echo "    See: https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html"
+    fi
+fi
 
 # ── Step 10: Generate catalog ──
 echo ""

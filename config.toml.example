@@ -30,6 +30,11 @@ history_source = "~/.local/state/kilo/prompt-history.jsonl"
 adapter = "adapters/kilocode/generate.sh"
 sync_script = "adapters/kilocode/sync-memory-bank.sh"
 
+# Model IDs use AWS Bedrock inference profiles by default.
+# Requires: aws CLI v2 + credentials with bedrock:ListInferenceProfiles permission.
+# Run `aiw models update` to auto-detect latest models from Bedrock.
+# For direct Anthropic API, use: "anthropic/claude-sonnet-4-latest"
+# For OpenRouter, use: "openrouter/anthropic/claude-sonnet-4"
 [tools.kilocode.models]
 arch = "amazon-bedrock/us.anthropic.claude-opus-4-6-v1"
 code = "amazon-bedrock/us.anthropic.claude-sonnet-4-6"
