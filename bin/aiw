@@ -1171,9 +1171,299 @@ for s in matches[:20]:
     print()
 "
             ;;
+        update)
+            local dry_run=false
+            local source_filter=""
+            while [ $# -gt 0 ]; do
+                case "$1" in
+                    --dry-run) dry_run=true ;;
+                    --source=*) source_filter="${1#--source=}" ;;
+                esac
+                shift
+            done
+
+            local plugin_dir="/mnt/c/Users/ashok.palle/.claude/skills/.claude-plugin"
+            local plugin_repo="/mnt/c/Users/ashok.palle/.claude/skills"
+            local state_file="${WORKSPACE}/skills/update-state.json"
+
+            # If source filter set, only allow "plugins" (the only git-based source)
+            if [ -n "$source_filter" ] && [ "$source_filter" != "plugins" ]; then
+                err "Only 'plugins' source supports update (it's the git-backed source)."
+                echo "Other sources (ralph, project-skills) are local directories."
+                return 1
+            fi
+
+            if [ ! -d "$plugin_repo/.git" ]; then
+                err "Git repo not found at ${plugin_repo}"
+                return 1
+            fi
+
+            info "Checking skill repo: ${plugin_repo}"
+
+            # Fetch latest — try HTTPS first, then SSH fallback
+            local fetch_ok=false
+            info "Fetching latest from origin..."
+            if git -C "$plugin_repo" fetch origin 2>/dev/null; then
+                fetch_ok=true
+            else
+                # HTTPS fetch failed — try switching to SSH
+                local current_remote
+                current_remote=$(git -C "$plugin_repo" remote get-url origin 2>/dev/null)
+                if [[ "$current_remote" == https://github.com/* ]]; then
+                    local repo_path
+                    repo_path=$(echo "$current_remote" | sed 's|https://github.com/||' | sed 's|\.git$||')
+                    local ssh_remote="git@github.com:${repo_path}.git"
+                    info "HTTPS fetch failed, trying SSH..."
+                    if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new -T git@github.com 2>&1 | grep -qi "successfully authenticated"; then
+                        info "SSH auth works. Switching remote to: ${ssh_remote}"
+                        git -C "$plugin_repo" remote set-url origin "$ssh_remote"
+                        if git -C "$plugin_repo" fetch origin 2>/dev/null; then
+                            fetch_ok=true
+                        fi
+                    fi
+                fi
+            fi
+
+            if ! $fetch_ok; then
+                warn "Could not fetch from remote (no network or auth)."
+                warn "Comparing against last-known origin/main instead."
+                if ! git -C "$plugin_repo" rev-parse origin/main >/dev/null 2>&1; then
+                    err "No cached origin/main ref. Cannot compare."
+                    err "Fix: configure git credentials or SSH key for GitHub."
+                    return 1
+                fi
+            fi
+
+            # Compare HEAD vs origin/main
+            local local_head remote_head
+            local_head=$(git -C "$plugin_repo" rev-parse HEAD 2>/dev/null)
+            remote_head=$(git -C "$plugin_repo" rev-parse origin/main 2>/dev/null)
+
+            if [ "$local_head" = "$remote_head" ]; then
+                ok "Already up to date (${local_head:0:7})"
+                return 0
+            fi
+
+            # Show incoming changes
+            echo ""
+            echo -e "${BOLD}Incoming changes:${NC}"
+            git -C "$plugin_repo" log --oneline "${local_head}..${remote_head}" 2>/dev/null
+            echo ""
+            echo -e "${BOLD}Files changed:${NC}"
+            git -C "$plugin_repo" diff --stat "${local_head}..${remote_head}" 2>/dev/null
+            echo ""
+
+            if $dry_run; then
+                info "Dry run — no changes applied."
+                echo "Run 'aiw skill update' (without --dry-run) to apply."
+                return 0
+            fi
+
+            if ! $fetch_ok; then
+                err "Cannot pull without a successful fetch. Fix network/auth and retry."
+                return 1
+            fi
+
+            # Stash local changes if any
+            local stashed=false
+            if ! git -C "$plugin_repo" diff --quiet 2>/dev/null; then
+                warn "Stashing local changes..."
+                git -C "$plugin_repo" stash push -m "aiw-skill-update-$(date +%Y%m%d%H%M%S)" 2>/dev/null
+                stashed=true
+            fi
+
+            # Pull with fast-forward only
+            info "Pulling changes (fast-forward)..."
+            if ! git -C "$plugin_repo" pull --ff-only origin main 2>&1; then
+                err "Fast-forward pull failed. The local branch may have diverged."
+                err "Fix: cd ${plugin_repo} && git pull --rebase origin main"
+                if $stashed; then
+                    warn "Restoring stashed changes..."
+                    git -C "$plugin_repo" stash pop 2>/dev/null || true
+                fi
+                return 1
+            fi
+
+            local new_head
+            new_head=$(git -C "$plugin_repo" rev-parse HEAD 2>/dev/null)
+
+            # Show marketplace version diff
+            local mp_file="${plugin_dir}/marketplace.json"
+            if [ -f "$mp_file" ]; then
+                local mp_version
+                mp_version=$(python3 -c "import json; print(json.load(open('${mp_file}')).get('metadata',{}).get('version','unknown'))" 2>/dev/null)
+                info "Marketplace version: ${mp_version}"
+            fi
+
+            # Regenerate catalog
+            info "Regenerating skill catalog..."
+            python3 "${WORKSPACE}/skills/generate-catalog.py"
+
+            # Count skills from catalog
+            local skill_count
+            skill_count=$(python3 -c "import json; print(len(json.load(open('${WORKSPACE}/skills/catalog.json'))))" 2>/dev/null || echo "?")
+
+            # Save update state
+            python3 -c "
+import json
+from datetime import datetime, timezone
+
+state_path = '${state_file}'
+
+# Load existing state or start fresh
+try:
+    state = json.load(open(state_path))
+except Exception:
+    state = {}
+
+state['plugins'] = {
+    'last_updated': datetime.now(timezone.utc).isoformat(),
+    'previous_commit': '${local_head}',
+    'current_commit': '${new_head}',
+    'marketplace_version': '$(python3 -c "import json; print(json.load(open('${mp_file}')).get('metadata',{}).get('version','?'))" 2>/dev/null || echo "?")',
+    'skill_count': ${skill_count},
+    'update_method': 'git-pull-ff',
+}
+
+with open(state_path, 'w') as f:
+    json.dump(state, f, indent=2)
+"
+            if $stashed; then
+                info "Restoring stashed changes..."
+                git -C "$plugin_repo" stash pop 2>/dev/null || warn "Stash pop had conflicts — check manually."
+            fi
+
+            ok "Updated: ${local_head:0:7} → ${new_head:0:7} (${skill_count} skills in catalog)"
+            ;;
+        status)
+            local catalog="${WORKSPACE}/skills/catalog.json"
+            local state_file="${WORKSPACE}/skills/update-state.json"
+
+            echo -e "${BOLD}${CYAN}Skill Sources${NC}"
+            echo ""
+
+            python3 -c "
+import json, os, subprocess
+from pathlib import Path
+from datetime import datetime
+
+sources = {
+    'plugins': {
+        'path': '/mnt/c/Users/ashok.palle/.claude/skills/.claude-plugin',
+        'type': 'claude-plugin (git repo)',
+        'git': True,
+    },
+    'ralph': {
+        'path': str(Path.home() / '.agents/skills'),
+        'type': 'ralph-skill (local)',
+        'git': False,
+    },
+    'project-skills': {
+        'path': '/mnt/c/Users/ashok.palle/n8n-workflows/.claude/skills',
+        'type': 'claude-project (local)',
+        'git': False,
+    },
+}
+
+# Load catalog for counts
+catalog = []
+try:
+    catalog = json.load(open('${catalog}'))
+except Exception:
+    pass
+
+source_map = {'claude-plugin': 'plugins', 'ralph': 'ralph', 'project': 'project-skills'}
+source_counts = {}
+for s in catalog:
+    key = source_map.get(s.get('source',''), s.get('source',''))
+    source_counts[key] = source_counts.get(key, 0) + 1
+
+for name, info in sources.items():
+    exists = os.path.isdir(info['path'])
+    count = source_counts.get(name, 0)
+    status_icon = '\033[0;32m●\033[0m' if exists else '\033[0;31m●\033[0m'
+    print(f'  {status_icon} {name:20s}  {count:4d} skills  ({info[\"type\"]})')
+    print(f'    Path: {info[\"path\"]}')
+
+    if info['git'] and exists:
+        try:
+            head = subprocess.check_output(
+                ['git', '-C', info['path'], 'log', '--oneline', '-1'],
+                stderr=subprocess.DEVNULL, text=True
+            ).strip()
+            branch = subprocess.check_output(
+                ['git', '-C', info['path'], 'rev-parse', '--abbrev-ref', 'HEAD'],
+                stderr=subprocess.DEVNULL, text=True
+            ).strip()
+            remote = subprocess.check_output(
+                ['git', '-C', info['path'], 'remote', 'get-url', 'origin'],
+                stderr=subprocess.DEVNULL, text=True
+            ).strip()
+            print(f'    Branch: {branch}  Latest: {head}')
+            print(f'    Remote: {remote}')
+        except Exception:
+            print(f'    Git: (unable to read)')
+
+    # Show marketplace version if available
+    if name == 'plugins':
+        mp = os.path.join(info['path'], 'marketplace.json')
+        if os.path.isfile(mp):
+            try:
+                data = json.load(open(mp))
+                ver = data.get('metadata', {}).get('version', '?')
+                plugin_count = len(data.get('plugins', []))
+                print(f'    Marketplace: v{ver} ({plugin_count} plugins)')
+            except Exception:
+                pass
+    print()
+
+print(f'  \033[1mCatalog total: {len(catalog)} skills\033[0m')
+
+# Catalog last generated
+try:
+    mtime = os.path.getmtime('${catalog}')
+    dt = datetime.fromtimestamp(mtime)
+    print(f'  Last generated: {dt.strftime(\"%Y-%m-%d %H:%M:%S\")}')
+except Exception:
+    pass
+print()
+
+# Last update state
+try:
+    state = json.load(open('${state_file}'))
+    if 'plugins' in state:
+        ps = state['plugins']
+        print('\033[1mLast Update\033[0m')
+        print(f'  Updated:   {ps.get(\"last_updated\", \"never\")[:19]}')
+        print(f'  Commit:    {ps.get(\"current_commit\", \"?\")[:7]}')
+        print(f'  Previous:  {ps.get(\"previous_commit\", \"?\")[:7]}')
+        print(f'  Version:   {ps.get(\"marketplace_version\", \"?\")}')
+        print(f'  Method:    {ps.get(\"update_method\", \"?\")}')
+        print()
+except Exception:
+    print('\033[2mNo update history yet. Run: aiw skill update\033[0m')
+    print()
+"
+            echo -e "${BOLD}Marketplace URLs${NC} ${DIM}(browse only — skills are installed locally)${NC}"
+            echo "  PDI ADO:     https://pdidev.visualstudio.com/PDI%20World/_git/pdi-claude-skills-market"
+            echo "  Anthropic:   https://github.com/anthropics/skills/tree/main/skills"
+            echo "  Smithery:    https://smithery.ai/skills"
+            echo "  SkillsLLM:   https://skillsllm.com/"
+            echo "  SkillsMP:    https://skillsmp.com/"
+            echo ""
+            echo -e "${BOLD}How Skills Are Loaded${NC}"
+            echo "  1. Sources scanned → catalog.json generated      (during 'aiw sync')"
+            echo "  2. 'aiw start <tool>' reads catalog + project context"
+            echo "  3. Tool adapter injects relevant skills into tool config:"
+            echo "     • Claude  → skills embedded in CLAUDE.md"
+            echo "     • KiloCode → skills embedded in .kilocode/rules/rules.md"
+            echo "     • Cline   → skills embedded in .clinerules"
+            echo "  4. During session, tool loads skills as context"
+            echo "  5. Skills matching project tags are auto-prioritized"
+            ;;
         *)
             err "Unknown skill command: ${subcmd}"
-            echo "Usage: aiw skill [list|add|search] [args]"
+            echo "Usage: aiw skill [list|add|search|update|status] [args]"
             ;;
     esac
 }
@@ -1619,6 +1909,8 @@ cmd_help() {
     echo "  skill list [--tag=TAG]  List skills from catalog"
     echo "  skill search <query>    Search skills by name/description"
     echo "  skill add <path>        Register skill and regenerate catalog"
+    echo "  skill update [--dry-run] [--source=X]  Pull latest skills, regenerate catalog"
+    echo "  skill status            Show source health, counts, and skill loading flow"
     echo "  models                          Show current models and variants"
     echo "  models update                   Auto-detect latest models, update config + aliases"
     echo "  models update --dry-run         Show what would change without writing"
