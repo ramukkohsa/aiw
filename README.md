@@ -6,19 +6,86 @@ A hub-and-spoke workspace that shares context, skills, and history across multip
 
 ## Table of Contents
 
-1. [Quick Start — Daily Workflow](#quick-start--daily-workflow)
-2. [How It Works](#how-it-works)
-3. [Directory Structure](#directory-structure)
-4. [The `aiw` CLI Reference](#the-aiw-cli-reference)
-5. [Daily Productivity Prompts](#daily-productivity-prompts)
-6. [Choosing the Right Tool + Model](#choosing-the-right-tool--model)
-7. [Model Upgrade Guide](#model-upgrade-guide)
-8. [Managing Skills](#managing-skills)
-9. [Context Management](#context-management)
-10. [Chat History, Crash Recovery & Resume](#chat-history-crash-recovery--resume)
-11. [Tool Handoffs](#tool-handoffs)
-12. [Adding Projects, Tools, Skills](#adding-projects-tools-skills)
-13. [Troubleshooting](#troubleshooting)
+1. [Installation — New Machine Setup](#installation--new-machine-setup)
+2. [Quick Start — Daily Workflow](#quick-start--daily-workflow)
+3. [How It Works](#how-it-works)
+4. [Directory Structure](#directory-structure)
+5. [The `aiw` CLI Reference](#the-aiw-cli-reference)
+6. [Daily Productivity Prompts](#daily-productivity-prompts)
+7. [Choosing the Right Tool + Model](#choosing-the-right-tool--model)
+8. [Model Upgrade Guide](#model-upgrade-guide)
+9. [Managing Skills](#managing-skills)
+10. [Context Management](#context-management)
+11. [Chat History, Crash Recovery & Resume](#chat-history-crash-recovery--resume)
+12. [Tool Handoffs](#tool-handoffs)
+13. [Adding Projects, Tools, Skills](#adding-projects-tools-skills)
+14. [Troubleshooting](#troubleshooting)
+
+---
+
+## Installation — New Machine Setup
+
+### Prerequisites
+
+- `git`, `python3` (required)
+- One or more AI CLI tools: `claude`, `kilo`, `cline`, `codex` (optional — install whichever you use)
+
+### 1. Clone the repo
+
+```bash
+git clone <repo-url> ~/.ai-workspace
+```
+
+### 2. Run the setup script
+
+```bash
+bash ~/.ai-workspace/bin/aiw-setup
+```
+
+This will:
+- Detect your environment (WSL, Linux, macOS)
+- Create `config.toml` from the included `config.toml.example` template
+- Prompt for your machine-specific paths (projects directory, skill sources)
+- Create required directories (`sessions/`, `history/`, `output/`, `skills/`)
+- Symlink `aiw` into `~/.local/bin/`
+- Check for installed tools
+- Generate the initial skill catalog
+
+### 3. Add your projects
+
+Edit `~/.ai-workspace/config.toml` and add `[projects.*]` sections for each of your repos:
+
+```toml
+[projects.my-project]
+path = "/path/to/my-project"
+context_overlay = "context/projects/my-project"
+description = "Brief description"
+tags = ["tag1", "tag2"]
+```
+
+### 4. Create context and sync
+
+```bash
+mkdir -p ~/.ai-workspace/context/projects/my-project
+# Create CONTEXT.md, brief.md, decisions.md (see templates/new-project.md)
+aiw sync
+```
+
+### Manual setup (without the script)
+
+If you prefer to set up manually:
+
+```bash
+cp ~/.ai-workspace/config.toml.example ~/.ai-workspace/config.toml
+# Edit config.toml — fill in your paths
+mkdir -p ~/.ai-workspace/{sessions,history/sessions,history/sources,output,skills}
+ln -sf ~/.ai-workspace/bin/aiw ~/.local/bin/aiw
+aiw sync
+```
+
+### Updating an existing installation
+
+`config.toml` contains your machine-specific paths and is safe to keep across `git pull`. All code files read paths from `config.toml` at runtime — no hardcoded paths in scripts.
 
 ---
 
@@ -81,6 +148,7 @@ aiw status
 ```
 ~/.ai-workspace/
 ├── config.toml           # Tool paths, project definitions, model aliases
+├── config.toml.example   # Portable template (copy to config.toml on new machines)
 ├── README.md             # This file
 │
 ├── context/              # SHARED CONTEXT — source of truth
@@ -111,7 +179,9 @@ aiw status
 ├── history/              # Unified history (symlinks to tool histories)
 ├── output/               # AI-generated files (date-partitioned)
 ├── templates/            # Templates for new skills/projects/tools
-└── bin/aiw               # CLI tool
+└── bin/
+    ├── aiw               # CLI tool
+    └── aiw-setup         # New machine bootstrap script
 ```
 
 ---
@@ -720,7 +790,7 @@ aiw sync   # Propagate to all other tools
 # 1. Add to config
 #    Edit ~/.ai-workspace/config.toml, add:
 #    [projects.my-project]
-#    path = "/mnt/c/Users/ashok.palle/my-project"
+#    path = "/path/to/my-project"
 #    context_overlay = "context/projects/my-project"
 #    description = "What this project does"
 #    tags = ["tag1", "tag2"]
@@ -792,7 +862,7 @@ which kilocode
 which codex
 
 # Check the project path exists
-ls /mnt/c/Users/ashok.palle/<project>
+ls /path/to/<project>
 ```
 
 ### History is empty
