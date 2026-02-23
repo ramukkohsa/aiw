@@ -27,9 +27,119 @@ A hub-and-spoke workspace that shares context, skills, and history across multip
 
 ### Prerequisites
 
-- `git`, `python3` (required)
+- `git`, `python3`, `node` v18+ / `npm` (required)
 - AWS CLI v2 configured with Bedrock access (required for KiloCode model routing and `aiw models`)
-- One or more AI CLI tools: `claude`, `kilo`, `cline`, `codex` (optional — install whichever you use)
+- One or more AI CLI tools (see [Installing AI Tools](#installing-ai-tools) below)
+
+### Installing AI Tools
+
+Install the tools you plan to use. All are installed via npm or pip.
+
+#### Required: Node.js and Python
+
+```bash
+# Node.js (via nvm — recommended)
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+nvm install 22
+node --version   # v22.x
+
+# Python 3.10+ (via system package manager)
+# Ubuntu/Debian:
+sudo apt install python3 python3-pip
+# macOS:
+brew install python3
+```
+
+#### AWS CLI v2
+
+Required for KiloCode model routing (`amazon-bedrock/` prefixed models) and `aiw models update`.
+
+```bash
+# Linux / WSL
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip awscliv2.zip && sudo ./aws/install
+
+# macOS
+brew install awscli
+
+# Configure credentials
+aws configure
+# Or use SSO:
+aws configure sso
+
+# Verify Bedrock access
+aws bedrock list-inference-profiles --region us-east-1 \
+  --query 'inferenceProfileSummaries[?contains(inferenceProfileId,`claude`)]' \
+  --output table
+```
+
+#### Claude Code (Anthropic CLI)
+
+```bash
+npm install -g @anthropic-ai/claude-code
+claude --version
+```
+
+Requires an Anthropic API key or AWS Bedrock credentials. Configure with `/model` inside Claude Code or edit `~/.claude/settings.json`.
+
+#### KiloCode (VS Code extension + CLI)
+
+```bash
+npm install -g kilocode
+kilo --version
+```
+
+KiloCode models are configured in `config.toml` under `[tools.kilocode.models]`. By default they use AWS Bedrock inference profiles. See [Model Upgrade Guide](#model-upgrade-guide) for details.
+
+#### Codex (OpenAI CLI)
+
+```bash
+npm install -g @openai/codex
+codex --version
+```
+
+Requires an OpenAI API key (`OPENAI_API_KEY`).
+
+#### Cline (VS Code extension)
+
+Cline runs as a VS Code extension, not a standalone CLI.
+
+1. Open VS Code
+2. Install the **Cline** extension from the marketplace
+3. Configure your API key in the extension settings
+
+`aiw start cline` opens VS Code in the project directory with synced `.clinerules`.
+
+#### Ralph TUI (task orchestrator)
+
+Ralph is a terminal UI for task orchestration. Install from the project repo:
+
+```bash
+# Check if available
+which ralph
+```
+
+Ralph doesn't require an LLM API key — it orchestrates tasks defined in bead/PRD files.
+
+#### Docker (for n8n stack — optional)
+
+Only needed if running the n8n observability stack locally.
+
+```bash
+# WSL: Enable Docker Desktop WSL integration
+# Docker Desktop → Settings → Resources → WSL Integration → Enable
+
+# Linux:
+sudo apt install docker.io docker-compose-plugin
+sudo usermod -aG docker $USER
+
+# macOS:
+brew install --cask docker
+
+# Verify
+docker --version
+docker compose version
+```
 
 ### 1. Clone the repo
 
@@ -72,30 +182,17 @@ mkdir -p ~/.ai-workspace/context/projects/my-project
 aiw sync
 ```
 
-### 5. AWS Bedrock setup (for KiloCode model routing)
+### 5. Auto-detect models
 
-KiloCode models in `config.toml` use AWS Bedrock inference profiles by default (`amazon-bedrock/us.anthropic.claude-*`). This requires:
+If AWS Bedrock is configured (see [AWS CLI v2](#aws-cli-v2) above), run:
 
-1. **Install AWS CLI v2** — [docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html](https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html)
-
-2. **Configure credentials** with Bedrock access:
-```bash
-aws configure
-# Or use SSO:
-aws configure sso
-```
-
-3. **Verify Bedrock access:**
-```bash
-aws bedrock list-inference-profiles --region us-east-1 --query 'inferenceProfileSummaries[?contains(inferenceProfileId,`claude`)]' --output table
-```
-
-4. **Auto-detect latest models:**
 ```bash
 aiw models update
 ```
 
-**Not using Bedrock?** The model IDs in `config.toml` under `[tools.kilocode.models]` can be changed to any provider format that KiloCode supports (e.g., `anthropic/claude-sonnet-4-latest` for direct Anthropic API, or `openrouter/anthropic/claude-sonnet-4` for OpenRouter). Claude Code uses its own model setting independently — configure it via `/model` inside Claude Code or `~/.claude/settings.json`.
+This queries Bedrock for the latest Claude inference profiles and updates `config.toml`.
+
+**Not using Bedrock?** Change the model IDs in `config.toml` under `[tools.kilocode.models]` to any provider format KiloCode supports (e.g., `anthropic/claude-sonnet-4-latest` for direct Anthropic API, or `openrouter/anthropic/claude-sonnet-4` for OpenRouter). Claude Code uses its own model setting — configure via `/model` inside Claude Code.
 
 ### Manual setup (without the script)
 
