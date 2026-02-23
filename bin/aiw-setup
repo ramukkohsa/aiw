@@ -36,12 +36,16 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     echo "  3. Prompts for machine-specific paths"
     echo "  4. Creates required directories"
     echo "  5. Symlinks aiw into ~/.local/bin"
-    echo "  6. Checks for required and optional tools"
-    echo "  7. Runs initial catalog generation"
+    echo "  6. Checks for required, recommended, and optional tools"
+    echo "  7. Validates AWS Bedrock access (for KiloCode model routing)"
+    echo "  8. Runs initial catalog generation"
     echo ""
     echo "Prerequisites:"
     echo "  - This repo cloned/copied to ~/.ai-workspace"
     echo "  - python3 and git installed"
+    echo "  - AWS CLI v2 configured with Bedrock access (recommended)"
+    echo "    Needed for KiloCode model routing and 'aiw models update'"
+    echo "    Not required if using direct Anthropic API or OpenRouter"
     exit 0
 fi
 
