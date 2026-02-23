@@ -6,7 +6,7 @@
 
 ```toml
 [projects.my-project]
-path = "/mnt/c/Users/ashok.palle/my-project"
+path = "/path/to/my-project"
 context_overlay = "context/projects/my-project"
 description = "Brief description of the project"
 tags = ["tag1", "tag2"]

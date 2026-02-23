@@ -9,11 +9,26 @@ from pathlib import Path
 WORKSPACE = Path.home() / ".ai-workspace"
 CATALOG = WORKSPACE / "skills" / "catalog.json"
 
-SOURCES = {
-    "claude-plugin": Path("/mnt/c/Users/ashok.palle/.claude/skills/.claude-plugin"),
-    "ralph": Path.home() / ".agents" / "skills",
-    "project": Path("/mnt/c/Users/ashok.palle/n8n-workflows/.claude/skills"),
-}
+
+def read_sources_from_config() -> dict[str, Path]:
+    """Read skill source paths from config.toml [skills.sources.*] sections."""
+    config_path = WORKSPACE / "config.toml"
+    if not config_path.exists():
+        return {}
+    config = config_path.read_text()
+    sources = {}
+    for m in re.finditer(
+        r'\[skills\.sources\.([\w-]+)\]\s*\n'
+        r'path\s*=\s*"([^"]+)"\s*\n'
+        r'type\s*=\s*"([^"]+)"',
+        config,
+    ):
+        name, path, stype = m.group(1), m.group(2), m.group(3)
+        sources[stype] = Path(path)
+    return sources
+
+
+SOURCES = read_sources_from_config()
 
 CATEGORY_TAGS = {
     "01-core": ["core", "development"],
@@ -155,9 +170,12 @@ def scan_project_skills(base: Path) -> list[dict]:
 
 def main():
     catalog = []
-    catalog.extend(scan_plugin_skills(SOURCES["claude-plugin"]))
-    catalog.extend(scan_ralph_skills(SOURCES["ralph"]))
-    catalog.extend(scan_project_skills(SOURCES["project"]))
+    if "claude-plugin" in SOURCES:
+        catalog.extend(scan_plugin_skills(SOURCES["claude-plugin"]))
+    if "ralph-skill" in SOURCES:
+        catalog.extend(scan_ralph_skills(SOURCES["ralph-skill"]))
+    if "claude-project" in SOURCES:
+        catalog.extend(scan_project_skills(SOURCES["claude-project"]))
 
     CATALOG.write_text(json.dumps(catalog, indent=2, ensure_ascii=False))
     print(f"Generated catalog with {len(catalog)} skills at {CATALOG}")

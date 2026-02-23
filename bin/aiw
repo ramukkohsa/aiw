@@ -1185,8 +1185,10 @@ for s in matches[:20]:
                 shift
             done
 
-            local plugin_dir="/mnt/c/Users/ashok.palle/.claude/skills/.claude-plugin"
-            local plugin_repo="/mnt/c/Users/ashok.palle/.claude/skills"
+            local plugin_dir
+            plugin_dir=$(config_get "skills.sources.plugins" "path")
+            local plugin_repo
+            plugin_repo=$(dirname "$plugin_dir")  # git root is parent of .claude-plugin
             local state_file="${WORKSPACE}/skills/update-state.json"
 
             # If source filter set, only allow "plugins" (the only git-based source)
@@ -1345,6 +1347,12 @@ with open(state_path, 'w') as f:
             echo -e "${BOLD}${CYAN}Skill Sources${NC}"
             echo ""
 
+            # Read source paths from config.toml
+            local src_plugins src_ralph src_project
+            src_plugins=$(config_get "skills.sources.plugins" "path")
+            src_ralph=$(config_get "skills.sources.ralph" "path")
+            src_project=$(config_get "skills.sources.project-skills" "path")
+
             python3 -c "
 import json, os, subprocess
 from pathlib import Path
@@ -1352,17 +1360,17 @@ from datetime import datetime
 
 sources = {
     'plugins': {
-        'path': '/mnt/c/Users/ashok.palle/.claude/skills/.claude-plugin',
+        'path': '${src_plugins}',
         'type': 'claude-plugin (git repo)',
         'git': True,
     },
     'ralph': {
-        'path': str(Path.home() / '.agents/skills'),
+        'path': '${src_ralph}',
         'type': 'ralph-skill (local)',
         'git': False,
     },
     'project-skills': {
-        'path': '/mnt/c/Users/ashok.palle/n8n-workflows/.claude/skills',
+        'path': '${src_project}',
         'type': 'claude-project (local)',
         'git': False,
     },

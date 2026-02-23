@@ -6,9 +6,16 @@ set -euo pipefail
 
 WORKSPACE="${HOME}/.ai-workspace"
 CATALOG="${WORKSPACE}/skills/catalog.json"
-PLUGIN_DIR="/mnt/c/Users/ashok.palle/.claude/skills/.claude-plugin"
-RALPH_DIR="${HOME}/.agents/skills"
-PROJECT_SKILL_DIR="/mnt/c/Users/ashok.palle/n8n-workflows/.claude/skills"
+CONFIG="${WORKSPACE}/config.toml"
+
+# Read a value from config.toml: config_val "skills.sources.plugins" "path"
+config_val() {
+    sed -n "/^\[${1}\]/,/^\[/p" "$CONFIG" | grep "^${2}" | head -1 | sed 's/.*= *"//' | sed 's/".*//'
+}
+
+PLUGIN_DIR=$(config_val "skills.sources.plugins" "path")
+RALPH_DIR=$(config_val "skills.sources.ralph" "path")
+PROJECT_SKILL_DIR=$(config_val "skills.sources.project-skills" "path")
 
 # Start JSON array
 echo '[' > "$CATALOG"

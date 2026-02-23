@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+# aiw-setup — Bootstrap a new machine for the Unified AI Workspace.
+# Copies config.toml.example, prompts for paths, creates directories,
+# and links the aiw CLI into ~/.local/bin.
+#
+# Usage: bash bin/aiw-setup [--help]
+
+set -euo pipefail
+
+# ── Colors ──
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+info()  { echo -e "${BLUE}[setup]${NC} $*"; }
+ok()    { echo -e "${GREEN}[setup]${NC} $*"; }
+warn()  { echo -e "${YELLOW}[setup]${NC} $*"; }
+err()   { echo -e "${RED}[setup]${NC} $*" >&2; }
+
+WORKSPACE="${HOME}/.ai-workspace"
+
+# ── Help ──
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    echo "Usage: aiw-setup [--help]"
+    echo ""
+    echo "Bootstrap a new machine for the Unified AI Workspace."
+    echo ""
+    echo "This script:"
+    echo "  1. Detects your environment (WSL, Linux, macOS)"
+    echo "  2. Creates config.toml from the example template"
+    echo "  3. Prompts for machine-specific paths"
+    echo "  4. Creates required directories"
+    echo "  5. Symlinks aiw into ~/.local/bin"
+    echo "  6. Checks for required and optional tools"
+    echo "  7. Runs initial catalog generation"
+    echo ""
+    echo "Prerequisites:"
+    echo "  - This repo cloned/copied to ~/.ai-workspace"
+    echo "  - python3 and git installed"
+    exit 0
+fi
+
+# ── Detect environment ──
+detect_env() {
+    if grep -qi microsoft /proc/version 2>/dev/null; then
+        echo "wsl"
+    elif [[ "$(uname -s)" == "Darwin" ]]; then
+        echo "macos"
+    else
+        echo "linux"
+    fi
+}
+
+# ── Prompt with default ──
+prompt_with_default() {
+    local prompt="$1"
+    local default="$2"
+    local result
+    echo -en "${CYAN}${prompt}${NC} [${DIM}${default}${NC}]: "
+    read -r result
+    echo "${result:-$default}"
+}
+
+# ── Confirm (default No) ──
+confirm() {
+    local prompt="$1"
+    local answer
+    echo -en "${CYAN}${prompt}${NC} [y/N]: "
+    read -r answer
+    [[ "$answer" =~ ^[Yy] ]]
+}
+
+echo ""
+echo -e "${BOLD}${CYAN}╔══════════════════════════════════════╗${NC}"
+echo -e "${BOLD}${CYAN}║   AI Workspace — New Machine Setup   ║${NC}"
+echo -e "${BOLD}${CYAN}╚══════════════════════════════════════╝${NC}"
+echo ""
+
+# ── Step 1: Detect environment ──
+ENV_TYPE=$(detect_env)
+info "Detected environment: ${BOLD}${ENV_TYPE}${NC}"
+
+# ── Step 2: Verify workspace directory ──
+if [ ! -d "$WORKSPACE" ]; then
+    err "Workspace directory not found at ${WORKSPACE}"
+    err "Clone the repo first: git clone <repo-url> ~/.ai-workspace"
+    exit 1
+fi
+
+EXAMPLE="${WORKSPACE}/config.toml.example"
+CONFIG="${WORKSPACE}/config.toml"
+
+if [ ! -f "$EXAMPLE" ]; then
+    err "Template not found at ${EXAMPLE}"
+    err "Make sure config.toml.example exists in the workspace."
+    exit 1
+fi
+
+# ── Step 3: Handle existing config ──
+if [ -f "$CONFIG" ]; then
+    warn "config.toml already exists."
+    if ! confirm "Overwrite with fresh template?"; then
+        info "Keeping existing config.toml. Skipping path setup."
+        info "Running remaining setup steps..."
+        SKIP_CONFIG=true
+    else
+        cp "$CONFIG" "${CONFIG}.bak"
+        ok "Backed up existing config to config.toml.bak"
+        SKIP_CONFIG=false
+    fi
+else
+    SKIP_CONFIG=false
+fi
+
+if [ "$SKIP_CONFIG" = false ]; then
+    # ── Step 4: Copy template ──
+    cp "$EXAMPLE" "$CONFIG"
+    ok "Created config.toml from template"
+
+    # ── Step 5: Interactive prompts ──
+    echo ""
+    echo -e "${BOLD}Configure your workspace paths:${NC}"
+    echo ""
+
+    # Workspace name
+    DEFAULT_NAME="$(whoami)-devops"
+    WS_NAME=$(prompt_with_default "Workspace name" "$DEFAULT_NAME")
+
+    # Detect project directories
+    DETECTED_PROJECTS=""
+    for candidate in "${HOME}/projects" "${HOME}/repos" "${HOME}/code" "${HOME}/src" "/mnt/c/Users/$(whoami)"; do
+        if [ -d "$candidate" ]; then
+            DETECTED_PROJECTS="$candidate"
+            break
+        fi
+    done
+
+    PROJECTS_DIR=$(prompt_with_default "Projects directory (where your repos live)" "${DETECTED_PROJECTS:-$HOME/projects}")
+
+    # Claude skills repo
+    DEFAULT_SKILLS=""
+    if [ -d "${HOME}/.claude/skills/.claude-plugin" ]; then
+        DEFAULT_SKILLS="${HOME}/.claude/skills/.claude-plugin"
+    fi
+    SKILLS_PLUGIN=$(prompt_with_default "Claude skills plugin path" "${DEFAULT_SKILLS:-/path/to/.claude/skills/.claude-plugin}")
+
+    # Ralph skills
+    DEFAULT_RALPH="${HOME}/.agents/skills"
+    RALPH_PATH=$(prompt_with_default "Ralph skills path" "$DEFAULT_RALPH")
+
+    # Project skills
+    DEFAULT_PROJECT_SKILLS=""
+    # Try to find a project with .claude/skills
+    if [ -d "$PROJECTS_DIR" ]; then
+        for proj_dir in "$PROJECTS_DIR"/*/; do
+            if [ -d "${proj_dir}.claude/skills" ]; then
+                DEFAULT_PROJECT_SKILLS="${proj_dir}.claude/skills"
+                break
+            fi
+        done
+    fi
+    PROJECT_SKILLS=$(prompt_with_default "Project-level skills path" "${DEFAULT_PROJECT_SKILLS:-/path/to/project/.claude/skills}")
+
+    # Default project name
+    DEFAULT_PROJECT="my-project"
+    if [ -n "$DEFAULT_PROJECT_SKILLS" ]; then
+        DEFAULT_PROJECT=$(basename "$(dirname "$(dirname "$DEFAULT_PROJECT_SKILLS")")")
+    fi
+    DEFAULT_PROJECT_NAME=$(prompt_with_default "Default project name" "$DEFAULT_PROJECT")
+
+    # ── Step 6: Fill config.toml ──
+    info "Writing config.toml..."
+
+    # Use sed to replace placeholder values
+    sed -i "s|^name = \"your-workspace-name\"|name = \"${WS_NAME}\"|" "$CONFIG"
+    sed -i "s|^root = \"/home/youruser/.ai-workspace\"|root = \"${WORKSPACE}\"|" "$CONFIG"
+    sed -i "s|^default_project = \"my-project\"|default_project = \"${DEFAULT_PROJECT_NAME}\"|" "$CONFIG"
+
+    # Skill source paths
+    sed -i "s|^path = \"/path/to/\\.claude/skills/\\.claude-plugin\".*|path = \"${SKILLS_PLUGIN}\"|" "$CONFIG"
+    sed -i "s|^path = \"/path/to/\\.agents/skills\".*|path = \"${RALPH_PATH}\"|" "$CONFIG"
+    sed -i "s|^path = \"/path/to/project/\\.claude/skills\".*|path = \"${PROJECT_SKILLS}\"|" "$CONFIG"
+
+    # Project path placeholder
+    sed -i "s|^path = \"/path/to/my-project\"|path = \"${PROJECTS_DIR}/${DEFAULT_PROJECT_NAME}\"|" "$CONFIG"
+
+    # WSL-specific: add wsl_root
+    if [ "$ENV_TYPE" = "wsl" ]; then
+        sed -i "s|^# wsl_root = \"/home/youruser/.ai-workspace\"|wsl_root = \"${WORKSPACE}\"|" "$CONFIG"
+    fi
+
+    ok "config.toml configured"
+fi
+
+# ── Step 7: Create required directories ──
+info "Creating workspace directories..."
+mkdir -p "${WORKSPACE}/sessions"
+mkdir -p "${WORKSPACE}/history/sessions"
+mkdir -p "${WORKSPACE}/history/sources"
+mkdir -p "${WORKSPACE}/output"
+mkdir -p "${WORKSPACE}/skills"
+ok "Directories created"
+
+# ── Step 8: Symlink aiw into PATH ──
+LOCAL_BIN="${HOME}/.local/bin"
+mkdir -p "$LOCAL_BIN"
+if [ -L "${LOCAL_BIN}/aiw" ]; then
+    info "Symlink ${LOCAL_BIN}/aiw already exists"
+elif [ -f "${LOCAL_BIN}/aiw" ]; then
+    warn "${LOCAL_BIN}/aiw exists but is not a symlink — skipping"
+else
+    ln -sf "${WORKSPACE}/bin/aiw" "${LOCAL_BIN}/aiw"
+    ok "Symlinked aiw → ${LOCAL_BIN}/aiw"
+fi
+
+# Also link aiw-setup for convenience
+if [ ! -e "${LOCAL_BIN}/aiw-setup" ]; then
+    ln -sf "${WORKSPACE}/bin/aiw-setup" "${LOCAL_BIN}/aiw-setup"
+fi
+
+# ── Step 9: Check tools ──
+echo ""
+echo -e "${BOLD}Checking tools:${NC}"
+
+check_tool() {
+    local name="$1"
+    local required="${2:-optional}"
+    if command -v "$name" &>/dev/null; then
+        echo -e "  ${GREEN}✓${NC} ${name}"
+        return 0
+    else
+        if [ "$required" = "required" ]; then
+            echo -e "  ${RED}✗${NC} ${name} ${DIM}(required — please install)${NC}"
+        else
+            echo -e "  ${YELLOW}○${NC} ${name} ${DIM}(optional)${NC}"
+        fi
+        return 1
+    fi
+}
+
+check_tool "python3" "required"
+check_tool "git" "required"
+check_tool "claude" "optional"
+check_tool "kilo" "optional"
+check_tool "cline" "optional"
+check_tool "codex" "optional"
+
+# ── Step 10: Generate catalog ──
+echo ""
+if [ -f "${WORKSPACE}/skills/generate-catalog.sh" ]; then
+    info "Generating skill catalog..."
+    if bash "${WORKSPACE}/skills/generate-catalog.sh" 2>/dev/null; then
+        ok "Skill catalog generated"
+    else
+        warn "Catalog generation had issues (sources may not exist yet)"
+    fi
+fi
+
+# ── Summary ──
+echo ""
+echo -e "${BOLD}${GREEN}╔══════════════════════════════════════╗${NC}"
+echo -e "${BOLD}${GREEN}║         Setup Complete!              ║${NC}"
+echo -e "${BOLD}${GREEN}╚══════════════════════════════════════╝${NC}"
+echo ""
+echo -e "  Workspace: ${BOLD}${WORKSPACE}${NC}"
+echo -e "  Config:    ${BOLD}${CONFIG}${NC}"
+echo ""
+echo -e "${BOLD}Next steps:${NC}"
+echo "  1. Review config.toml and add your projects"
+echo "  2. Create context overlays: mkdir -p ~/.ai-workspace/context/projects/<name>"
+echo "  3. Run: aiw sync"
+echo "  4. Start a session: aiw start claude <project>"
+echo ""
+
+# Check if ~/.local/bin is in PATH
+if [[ ":$PATH:" != *":${LOCAL_BIN}:"* ]]; then
+    warn "${LOCAL_BIN} is not in your PATH."
+    echo "  Add to your shell profile:"
+    echo "    export PATH=\"\$HOME/.local/bin:\$PATH\""
+fi
