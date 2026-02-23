@@ -65,7 +65,7 @@ prompt_with_default() {
     local prompt="$1"
     local default="$2"
     local result
-    echo -en "${CYAN}${prompt}${NC} [${DIM}${default}${NC}]: "
+    echo -en "${CYAN}${prompt}${NC} [${DIM}${default}${NC}]: " >&2
     read -r result
     echo "${result:-$default}"
 }
@@ -74,7 +74,7 @@ prompt_with_default() {
 confirm() {
     local prompt="$1"
     local answer
-    echo -en "${CYAN}${prompt}${NC} [y/N]: "
+    echo -en "${CYAN}${prompt}${NC} [y/N]: " >&2
     read -r answer
     [[ "$answer" =~ ^[Yy] ]]
 }
